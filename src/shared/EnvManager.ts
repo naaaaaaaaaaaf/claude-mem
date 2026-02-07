@@ -13,6 +13,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
+import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from './paths.js';
 
 // Path to claude-mem's centralized .env file
 const DATA_DIR = join(homedir(), '.claude-mem');
@@ -229,6 +231,14 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     }
     if (credentials.OPENROUTER_API_KEY) {
       isolatedEnv.OPENROUTER_API_KEY = credentials.OPENROUTER_API_KEY;
+    }
+
+    // 4. Add explicit Claude SDK configuration from settings.json
+    // This enables custom Claude Code backends (e.g., GLM) without inheriting
+    // project-level .env files or shell environment variables.
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (settings.CLAUDE_MEM_ANTHROPIC_BASE_URL && !isolatedEnv.ANTHROPIC_BASE_URL) {
+      isolatedEnv.ANTHROPIC_BASE_URL = settings.CLAUDE_MEM_ANTHROPIC_BASE_URL;
     }
   }
 
