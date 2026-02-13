@@ -1,0 +1,86 @@
+name: Auto rebase patch
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: thedotmack/claude-mem
+  PATCH_BRANCH: patch/anthropic-base-url
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/${UPSTREAM_REPO}.git
+          git fetch upstream --tags
+          git fetch origin --tags
+
+      - name: Rebase patch branch when new tag appears
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          latest_tag=$(git for-each-ref --sort=-version:refname --format='%(refname:short)' refs/tags | head -n 1)
+          if [ -z "$latest_tag" ]; then
+            echo "No tags found; skipping."
+            exit 0
+          fi
+
+          latest_tag_commit=$(git rev-list -n 1 "$latest_tag")
+          if git merge-base --is-ancestor "$latest_tag_commit" "origin/$DEFAULT_BRANCH"; then
+            echo "Default branch already contains latest tag $latest_tag; skipping."
+            exit 0
+          fi
+
+          if git show-ref --verify --quiet "refs/remotes/origin/$PATCH_BRANCH"; then
+            git checkout -B "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
+          else
+            echo "Patch branch origin/$PATCH_BRANCH not found; aborting."
+            exit 1
+          fi
+
+          # Drop generated artifact + workflow maintenance commits before rebasing.
+          # These commits are maintained on default branch only and must not be replayed on patch branch.
+          GIT_SEQUENCE_EDITOR="sed -i '/Rebuild plugin artifacts/d; /auto-rebase.*workflow/d; /workflow.*auto-rebase/d; /Grant workflows permission/d; /Match auto-rebase patch commit pattern/d; /Stabilize auto-rebase/d'" git rebase -i "upstream/$DEFAULT_BRANCH"
+
+          git push origin "$PATCH_BRANCH" --force-with-lease
+
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          git reset --hard "$PATCH_BRANCH"
+
+          # Keep this workflow on default branch even though upstream doesn't have it.
+          if git show "origin/$DEFAULT_BRANCH:.github/workflows/auto-rebase-patch.yml" > /tmp/auto-rebase-patch.yml 2>/dev/null; then
+            mkdir -p .github/workflows
+            cp /tmp/auto-rebase-patch.yml .github/workflows/auto-rebase-patch.yml
+            git add .github/workflows/auto-rebase-patch.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "Restore auto-rebase workflow"
+            fi
+          fi
+
+          npm install
+          npm run build
+
+          if ! git diff --quiet; then
+            git add plugin
+            git commit -m "Rebuild plugin artifacts"
+          fi
+          git push origin "$DEFAULT_BRANCH" --force-with-lease
