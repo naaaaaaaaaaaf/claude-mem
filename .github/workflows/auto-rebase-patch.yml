@@ -57,24 +57,29 @@ jobs:
             exit 1
           fi
 
+          # 1) Sync default branch from upstream, but keep workflow files from fork.
+          #    This avoids push rejection caused by workflow-file updates with GITHUB_TOKEN.
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          git restore --source "upstream/$DEFAULT_BRANCH" --worktree --staged -- .
+          git restore --source "origin/$DEFAULT_BRANCH" --worktree --staged -- .github/workflows || true
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "Sync upstream (exclude workflows)"
+            git push origin "$DEFAULT_BRANCH"
+          fi
+
+          # 2) Rebase patch branch onto fork default branch (not upstream directly).
+          #    This keeps workflow changes out of patch push history.
+          git checkout -B "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
           # Drop generated artifact + workflow maintenance commits before rebasing.
           # These commits are maintained on default branch only and must not be replayed on patch branch.
-          GIT_SEQUENCE_EDITOR="sed -i '/Rebuild plugin artifacts/d; /auto-rebase.*workflow/d; /workflow.*auto-rebase/d; /Grant workflows permission/d; /Match auto-rebase patch commit pattern/d; /Stabilize auto-rebase/d'" git rebase -i "upstream/$DEFAULT_BRANCH"
+          GIT_SEQUENCE_EDITOR="sed -i '/Rebuild plugin artifacts/d; /auto-rebase.*workflow/d; /workflow.*auto-rebase/d; /Grant workflows permission/d; /Match auto-rebase patch commit pattern/d; /Stabilize auto-rebase/d; /Sync upstream \(exclude workflows\)/d'" git rebase -i "origin/$DEFAULT_BRANCH"
 
           git push origin "$PATCH_BRANCH" --force-with-lease
 
+          # 3) Fast-forward default branch to patch, then build plugin artifacts on default branch.
           git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
-          git reset --hard "$PATCH_BRANCH"
-
-          # Keep this workflow on default branch even though upstream doesn't have it.
-          if git show "origin/$DEFAULT_BRANCH:.github/workflows/auto-rebase-patch.yml" > /tmp/auto-rebase-patch.yml 2>/dev/null; then
-            mkdir -p .github/workflows
-            cp /tmp/auto-rebase-patch.yml .github/workflows/auto-rebase-patch.yml
-            git add .github/workflows/auto-rebase-patch.yml
-            if ! git diff --cached --quiet; then
-              git commit -m "Restore auto-rebase workflow"
-            fi
-          fi
+          git merge --ff-only "$PATCH_BRANCH"
 
           npm install
           npm run build
@@ -83,4 +88,4 @@ jobs:
             git add plugin
             git commit -m "Rebuild plugin artifacts"
           fi
-          git push origin "$DEFAULT_BRANCH" --force-with-lease
+          git push origin "$DEFAULT_BRANCH"
