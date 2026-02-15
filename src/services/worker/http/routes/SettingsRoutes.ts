@@ -94,7 +94,6 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_GEMINI_API_KEY',
       'CLAUDE_MEM_GEMINI_MODEL',
       'CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED',
-      'ANTHROPIC_BASE_URL',
       // OpenRouter Configuration
       'CLAUDE_MEM_OPENROUTER_API_KEY',
       'CLAUDE_MEM_OPENROUTER_MODEL',

@@ -21,7 +21,6 @@ export interface SettingsDefaults {
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
-  ANTHROPIC_BASE_URL: string;
   CLAUDE_MEM_GEMINI_API_KEY: string;
   CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
@@ -56,6 +55,15 @@ export interface SettingsDefaults {
   // Exclusion Settings
   CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
   CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;  // JSON array of folder paths to exclude from CLAUDE.md generation
+  // Chroma Vector Database Configuration
+  CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
+  CLAUDE_MEM_CHROMA_HOST: string;
+  CLAUDE_MEM_CHROMA_PORT: string;
+  CLAUDE_MEM_CHROMA_SSL: string;
+  // Future cloud support
+  CLAUDE_MEM_CHROMA_API_KEY: string;
+  CLAUDE_MEM_CHROMA_TENANT: string;
+  CLAUDE_MEM_CHROMA_DATABASE: string;
 }
 
 export class SettingsDefaultsManager {
@@ -71,7 +79,6 @@ export class SettingsDefaultsManager {
     // AI Provider Configuration
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
     CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'cli',  // Default to CLI subscription billing (not API key)
-    ANTHROPIC_BASE_URL: '',
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',  // Default Gemini model (highest free tier RPM)
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
@@ -106,6 +113,15 @@ export class SettingsDefaultsManager {
     // Exclusion Settings
     CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
     CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
+    // Chroma Vector Database Configuration
+    CLAUDE_MEM_CHROMA_MODE: 'local',           // 'local' starts npx chroma run, 'remote' connects to existing server
+    CLAUDE_MEM_CHROMA_HOST: '127.0.0.1',
+    CLAUDE_MEM_CHROMA_PORT: '8000',
+    CLAUDE_MEM_CHROMA_SSL: 'false',
+    // Future cloud support (claude-mem pro)
+    CLAUDE_MEM_CHROMA_API_KEY: '',
+    CLAUDE_MEM_CHROMA_TENANT: 'default_tenant',
+    CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
   };
 
   /**

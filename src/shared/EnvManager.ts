@@ -13,7 +13,6 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
-import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
 
 // Path to claude-mem's centralized .env file
 const DATA_DIR = join(homedir(), '.claude-mem');
@@ -28,6 +27,7 @@ export const ENV_FILE_PATH = join(DATA_DIR, '.env');
 // are passed through to avoid breaking CLI authentication, proxies, and platform features.
 const BLOCKED_ENV_VARS = [
   'ANTHROPIC_API_KEY',  // Issue #733: Prevent auto-discovery from project .env files
+  'CLAUDECODE',         // Prevent "cannot be launched inside another Claude Code session" error
 ];
 
 // Credential keys that claude-mem manages
@@ -226,11 +226,6 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     if (!isolatedEnv.ANTHROPIC_API_KEY && process.env.CLAUDE_CODE_OAUTH_TOKEN) {
       isolatedEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     }
-  }
-
-  const settings = SettingsDefaultsManager.loadFromFile(join(DATA_DIR, 'settings.json'));
-  if (settings.ANTHROPIC_BASE_URL) {
-    isolatedEnv.ANTHROPIC_BASE_URL = settings.ANTHROPIC_BASE_URL;
   }
 
   return isolatedEnv;
