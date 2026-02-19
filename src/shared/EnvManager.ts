@@ -13,7 +13,6 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
-import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
 
 // Path to claude-mem's centralized .env file
 const DATA_DIR = join(homedir(), '.claude-mem');
@@ -227,12 +226,6 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     if (!isolatedEnv.ANTHROPIC_API_KEY && process.env.CLAUDE_CODE_OAUTH_TOKEN) {
       isolatedEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     }
-  }
-
-  // 5. Override ANTHROPIC_BASE_URL from claude-mem settings when configured
-  const settings = SettingsDefaultsManager.loadFromFile(join(DATA_DIR, 'settings.json'));
-  if (settings.ANTHROPIC_BASE_URL) {
-    isolatedEnv.ANTHROPIC_BASE_URL = settings.ANTHROPIC_BASE_URL;
   }
 
   return isolatedEnv;
