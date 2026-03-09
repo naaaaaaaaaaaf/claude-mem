@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem.
 
+## [v10.5.4] - 2026-03-09
+
+## Bug Fixes
+
+- **fix: restore modes to correct location** — All modes (`code`, code language variants, `email-investigation`) were erroneously moved from `plugin/modes/` to `plugin/hooks/modes/` during the v10.5.3 release, breaking mode loading. This patch restores them to `plugin/modes/` where they belong.
+
+## [v10.5.3] - 2026-03-09
+
+## What's New
+
+### Law Study Mode
+
+Adds `law-study` — a purpose-built claude-mem mode for law students.
+
+**Observation Types:**
+- **Case Holding** — 2-3 sentence brief with extracted legal rule
+- **Issue Pattern** — exam trigger or fact pattern that signals a legal issue
+- **Prof Framework** — professor's analytical lens and emphasis for a topic
+- **Doctrine / Rule** — legal test or standard synthesized from cases/statutes
+- **Argument Structure** — legal argument or counter-argument worked through analytically
+- **Cross-Case Connection** — insight linking cases or doctrines to reveal a deeper principle
+
+**Concepts (cross-cutting tags):**
+`exam-relevant` · `minority-position` · `gotcha` · `unsettled-law` · `policy-rationale` · `course-theme`
+
+**Chill Variant** — `law-study--chill` records only high-signal items: issue patterns, gotchas, and professor frameworks. Skips routine case holdings unless the result is counterintuitive.
+
+**CLAUDE.md Template** — `law-study-CLAUDE.md` is a drop-in template for any law study project directory. It configures Claude as a Socratic legal study partner: precise case briefs, critical document analysis, issue spotting, and doctrine synthesis — without writing exam answers for the student.
+
+Activate with: `/mode law-study` or `/mode law-study--chill`
+
 ## [v10.5.2] - 2026-02-26
 
 ## Smart Explore Benchmark Docs & Skill Update
@@ -1155,37 +1186,4 @@ Version 9.0.0 introduces the **Live Context System** - a major new capability th
 ## Full Changelog
 
 See PR #558 for complete details and diagnostic reports.
-
-## [v8.5.9] - 2026-01-04
-
-## What's New
-
-### Context Header Timestamp
-
-The context injection header now displays the current date and time, making it easier to understand when context was generated.
-
-**Example:** `[claude-mem] recent context, 2026-01-04 2:46am EST`
-
-This appears in both terminal (colored) output and markdown format, including empty state messages.
-
----
-
-**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v8.5.8...v8.5.9
-
-## [v8.5.8] - 2026-01-04
-
-## Bug Fixes
-
-- **#511**: Add `gemini-3-flash` model to GeminiAgent with proper rate limits and validation
-- **#517**: Fix Windows process management by replacing PowerShell with WMIC (fixes Git Bash/WSL compatibility)
-- **#527**: Add Apple Silicon Homebrew paths (`/opt/homebrew/bin`) for `bun` and `uv` detection
-- **#531**: Remove duplicate type definitions from `export-memories.ts` using shared bridge file
-
-## Tests
-
-- Added regression tests for PR #542 covering Gemini model support, WMIC parsing, Apple Silicon paths, and export type refactoring
-
-## Documentation
-
-- Added detailed analysis reports for GitHub issues #511, #514, #517, #520, #527, #531, #532
 
