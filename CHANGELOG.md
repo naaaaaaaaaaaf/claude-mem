@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.2.0] - 2026-05-12
+
+## What's new
+
+### `wowerpoint` skill — kawaii NotebookLM slide-deck generator
+
+Turn one source document into a kawaii NotebookLM slide-deck PDF. Wraps the `notebooklm` CLI with the kawaii-prompt + `--format detailed` defaults and a spawn-subagent pattern so generation (~10 min) never blocks the main conversation.
+
+- **Single-source-per-deck** is enforced by the workflow shape: confirm or write the source doc *before* adding it to NotebookLM. Don't paper over a weak source by stacking more sources — write a comprehensive doc first.
+- **Slide-deck only.** Videos and podcasts from the same engine are noticeably worse and out of scope; the skill refers users to the `notebooklm` CLI directly for those formats.
+- **Default prompt template:** `Use kawaii characters to tell the story of <subject>. Keep it warm and clear.` Pass any user-supplied prompt through verbatim.
+- **Setup requires** `notebooklm-py` (via `uv tool install --with playwright`), `playwright install chromium`, and `jq`.
+- **Spawn-and-end-turn** pattern: the subagent's completion notification fires when the PDF is on disk; the main conversation never blocks on the ~10 min render.
+
+See PR #2430 for the full design notes and review history.
+
+## Skills inventory
+
+This release brings the plugin to **12 skills**: babysit, do, how-it-works, knowledge-agent, learn-codebase, make-plan, mem-search, pathfinder, smart-explore, timeline-report, version-bump, wowerpoint.
+
+## [13.1.0] - 2026-05-11
+
+## Server-beta event pipeline (phases 4–13)
+
+This release lands the full server-beta track developed on `server-beta-phase-4-event-pipeline` — a self-contained Postgres + BullMQ event-to-observation pipeline with API-key auth, team/project scope, audit log, three AI providers (Anthropic, OpenAI, Google), a dedicated MCP server, legacy compat adapters for existing worker clients, a Docker/Compose stack, and a generation-job retry/cancel surface.
+
+### Highlights
+
+- **Event pipeline**: `agent_event` → `observation_generation_jobs` (outbox) → BullMQ worker → `observation` row. Idempotent enqueue, request-id propagation end-to-end, structured audit log.
+- **API surface**: `POST /v1/events`, `POST /v1/sessions/start`, `POST /v1/sessions/:id/end`, generation-job list/retry/cancel, MCP routes, scoped reads.
+- **Legacy compat**: `/api/sessions/observations` and `/api/sessions/summarize` shims map legacy worker payloads into the new event/job model without touching worker code. Both shims now wrap session lookup in their try/catch so Postgres failures return structured JSON, and `resolveServerSession` survives TOCTOU races via 23505 catch-and-refetch.
+- **POST /v1/sessions/start** also catches 23505 on concurrent start with the same `externalSessionId` and refetches the winning row instead of returning 500.
+- **Generation providers**: Anthropic, OpenAI, and Google with per-team-project scope enforcement and error classification.
+- **Docker / Compose stack** and `bin/server-beta-cli` for local operator workflows.
+
+### Bug fixes
+
+- `resolveServerSession` Postgres errors no longer escape `asyncHandler.catch(next)` and return HTML 500s to legacy clients.
+- `POST /v1/sessions/start` no longer returns 500 to the loser of a concurrent same-`externalSessionId` race.
+
+Full PR thread: #2383.
+
 ## [13.0.1] - 2026-05-10
 
 ## Bug fixes
