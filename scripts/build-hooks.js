@@ -106,8 +106,9 @@ function shellTemplateManifest(buildShellCommand) {
     'plugin/.mcp.json': {
       kind: 'mcp',
       command: buildShellCommand({
+        // The mcp Node launcher derives its spawn target from requireFile, so
+        // no trailingCommand is needed (it is ignored for this host).
         host: 'mcp', requireFile: 'mcp-server.cjs',
-        trailingCommand: ['exec', 'node', '"$_P/scripts/mcp-server.cjs"'],
         notFoundMessage: 'claude-mem: mcp server not found',
         mcpExtraCandidates: ['$PWD/plugin', '$PWD'],
         mcpExtraCacheRoots: [
@@ -175,6 +176,19 @@ async function verifyShellTemplateCanonical() {
     );
   }
 
+  // Parser-compat guard (issue #2791): bun-runner.js is invoked by hosts that
+  // may run a pre-ES2020 Node whose ESM loader throws on optional chaining.
+  // Strip comments, then forbid `?.` / `??` in executable code.
+  const bunRunnerCode = bunRunner
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  if (/\?\.|\?\?/.test(bunRunnerCode)) {
+    throw new Error(
+      'plugin/scripts/bun-runner.js uses optional chaining (?.) or nullish coalescing (??) — ' +
+      'this launcher must parse on pre-ES2020 Node (issue #2791). Rewrite with explicit guards.'
+    );
+  }
+
   console.log('✓ Rule A shell templates match the canonical generator');
 }
 
@@ -206,7 +220,7 @@ async function buildHooks() {
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
       dependencies: {
-        'zod': '^4.3.6',
+        'zod': '^4.4.3',
         'tree-sitter-cli': '^0.26.5',
         'tree-sitter-c': '^0.24.1',
         'tree-sitter-cpp': '^0.23.4',
