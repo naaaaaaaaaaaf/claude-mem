@@ -15,6 +15,7 @@ import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
 import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
+import { captureEvent } from '../../telemetry/telemetry.js';
 
 /**
  * Consecutive non-XML observer outputs tolerated before we kill and respawn the
@@ -35,6 +36,7 @@ export async function processAgentResponse(
   projectRoot?: string,
   modelId?: string
 ): Promise<void> {
+  const processingStartedAt = Date.now();
   session.lastGeneratorActivity = Date.now();
 
   if (text) {
@@ -170,6 +172,72 @@ export async function processAgentResponse(
   });
 
   session.lastSummaryStored = result.summaryId !== null;
+
+  // Telemetry: counts, enums, and REAL usage only (lastUsage is never an
+  // estimate — providers leave it null when the API gave no usage split).
+  const providerName =
+    session.currentProvider ??
+    ({ SDK: 'claude', Gemini: 'gemini', OpenRouter: 'openrouter' } as Record<string, string>)[agentName] ??
+    'claude';
+  const typeCounts: Record<string, number> = { bugfix: 0, discovery: 0, decision: 0, refactor: 0, other: 0 };
+  for (const obs of labeledObservations) {
+    const bucket = obs.type in typeCounts && obs.type !== 'other' ? obs.type : 'other';
+    typeCounts[bucket]++;
+  }
+  const dominantType = (Object.entries(typeCounts) as Array<[string, number]>)
+    .reduce((best, entry) => (entry[1] > best[1] ? entry : best), ['other', -1])[0];
+  const usage = session.lastUsage;
+  const compressionMs = session.lastPromptSentAt ? Date.now() - session.lastPromptSentAt : undefined;
+  session.lastUsage = null;
+  session.lastPromptSentAt = null;
+
+  const compressionProps: Record<string, unknown> = {
+    outcome: 'ok',
+    duration_ms: Date.now() - processingStartedAt,
+    count: result.observationIds.length,
+    has_summary: session.lastSummaryStored,
+    provider: providerName,
+    // Settings are raw JSON passthrough, so a misconfigured model can arrive
+    // as an array/null; the scrubber drops non-strings silently, which read
+    // as "no model" in PostHog — stamp 'unknown' instead.
+    model: typeof modelId === 'string' && modelId ? modelId : 'unknown',
+    ide: session.platformSource,
+    hook: session.lastGeneratorSource,
+    endpoint_class: session.endpointClass,
+    compression_ms: compressionMs,
+    observation_type: labeledObservations.length > 0 ? dominantType : undefined,
+    obs_type_bugfix: typeCounts.bugfix,
+    obs_type_discovery: typeCounts.discovery,
+    obs_type_decision: typeCounts.decision,
+    obs_type_refactor: typeCounts.refactor,
+    obs_type_other: typeCounts.other,
+  };
+
+  if (agentName === 'SDK') {
+    // Claude path: the streamed assistant message's usage.output_tokens is an
+    // early-streaming placeholder (single digits), not the real count. The
+    // finalized per-turn usage and cumulative cost arrive on the SDK `result`
+    // message — stash the event and let ClaudeProvider fire it from there. A
+    // still-stashed event here means the prior turn never produced a result
+    // (abort/kill): ship it without token fields rather than lose it.
+    if (session.pendingCompressionEvent) {
+      captureEvent('session_compressed', session.pendingCompressionEvent);
+    }
+    session.pendingCompressionEvent = compressionProps;
+  } else {
+    captureEvent('session_compressed', {
+      ...compressionProps,
+      tokens_input: usage?.input,
+      tokens_output: usage?.output,
+      cost_usd: usage?.costUsd,
+      // input > 0 guard: a gateway that reports output without input must not
+      // produce a literal 0.0 ratio (it crushed per-model averages in PostHog).
+      compression_ratio:
+        usage && usage.input > 0 && usage.output > 0
+          ? Math.round((usage.input / usage.output) * 100) / 100
+          : undefined,
+    });
+  }
 
   if (summary && (summary.skipped || session.lastSummaryStored)) {
     await ingestSummary({
