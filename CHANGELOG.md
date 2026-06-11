@@ -4,6 +4,68 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.5.6] - 2026-06-11
+
+## Worker restart: single source of truth (#2894)
+
+This release rearchitects worker lifecycle management to eliminate the restart races behind version-recycle ping-pong storms, EADDRINUSE failures, and "healthy worker reports as not running" lies.
+
+### Highlights
+
+- **Self-replacing worker** — on restart, the dying worker spawns its own successor the moment its port frees. Old and new workers never coexist, and nothing external races to spawn into the gap. Hooks wait for the successor and lazy-spawn only as a fallback, at most one recycle per hook event.
+- **Restarts prove themselves** — `worker-service restart` now polls `/api/health` until the pid changes AND the version matches the new build, prints `Worker restart verified (pid, version)`, and exits 1 on failure instead of reporting success over a dead or stale worker. The daemon's generic start-failure path also exits 1 now.
+- **One spawn gate** — a `wx`-flag lockfile (`spawn.lock`, 60s mtime staleness, owner-checked release) serializes every external spawn path: hook lazy-spawn, MCP server, and the CLI restart fallback. Lock losers wait for the winner's worker instead of colliding. The two divergent Bun resolvers are unified (closing the kill-then-can't-respawn path), and the MCP server now prefers the marketplace worker script over stale plugin-cache copies.
+- **PID file demoted to diagnostics** — liveness truth is the port + `/api/health`. Every PID-file deletion is owner-guarded, so a dying worker can never clobber its successor's file; `status` reports pid/version/uptime/workerPath from health alone and survives PID-file deletion.
+- **First-run fix** — settings bootstrap notices now go to stderr, never stdout: the very first hook invocation on a fresh install no longer emits corrupted JSON to the hook framework.
+- **Build chain hardened** — the dev sync-script's installed-version cache mirror (which wrote new code into old version dirs, manufacturing permanent version disagreement) and its duplicate HTTP restart trigger are deleted; `build-and-sync` restarts through one verified CLI path.
+- **Test hygiene** — the test suite can no longer touch the real `~/.claude-mem` (a preload tripwire isolates every run), ending sentinel-PID and corrupt-JSON pollution of production state.
+
+### Validation
+
+Triple-restart soak (3× consecutive verified restarts, zero duplicate/EADDRINUSE events), plus a live re-creation of the original stale-launcher bug under concurrent session crossfire: one recycle per stale instance, convergence in 16 seconds, zero ping-pong over an 8.5-minute watch. 2,247 tests pass.
+
+## [13.5.5] - 2026-06-10
+
+## Telemetry Reliability Signals (Plan 14)
+
+claude-mem instrumented success well — failure was invisible. This release adds the five highest-value missing reliability signals (#2874). Everything is closed-enum/count-only, whitelisted in the scrubber, and disclosed in both the [public docs](https://docs.claude-mem.ai/telemetry) and `claude-mem telemetry`.
+
+### Search retrieval quality (`search_performed`)
+- `result_count`, `search_strategy` (`chroma|fts|filter_only`), `chroma_available`, `fallback_reason` (`none|chroma_connection|chroma_error|chroma_not_initialized`)
+- Zero-result rate is now computable, and Chroma's silent degradation to FTS is visible.
+
+### Compression trust (`session_compressed`)
+- `fabrication_detected` / `fabricated_count` — commit-hash fabrication by the observer model, on every emit path
+- Respawn-gated invalid-output events: `invalid_output_class` (`xml|idle|prose|poisoned`), `consecutive_invalid_outputs`, `respawn_triggered`
+- `outcome: aborted` with `abort_reason` (`idle|shutdown|overflow|restart_guard|quota|poisoned|none`), emitted where all abort flows converge
+
+### Worker lifecycle
+- New `worker_stopped` event: `uptime_seconds`, `shutdown_reason` (`stop|restart|signal`)
+- Crash detection via clean-shutdown sentinel: `worker_started` now reports `previous_shutdown` (`crash|clean|unknown`) and `previous_uptime_seconds`
+- Memory health: integer `process_rss_mb` / `heap_used_mb` on lifecycle events and the heartbeat
+
+### Hook failures
+- New `hook_failed` event over the direct CLI transport (the worker being unreachable IS the failure being reported), threshold-gated on the fail-loud counter and awaited before process exit so events survive short-lived hook processes
+
+### Fixes
+- **CI**: the PostHog `disableGeoip` regression test was order-dependent and failed full-suite runs (CI on main had been red since v13.5.4). `posthog-node` is now mocked globally via a bun test preload — which also guarantees test runs can never construct a real PostHog client and flush fabricated events into production analytics.
+- Windows-managed shutdown IPC now forwards the restart reason for `shutdown_reason` fidelity.
+
+## [13.5.4] - 2026-06-10
+
+## Fixed
+
+- **Telemetry geolocation: closed the ~98.5% "unknown location" gap.** The posthog-node SDK assumes server deployments and stamps `$geoip_disable: true` on every event by default. claude-mem's worker runs on the user's own machine, so this needlessly suppressed PostHog's ingest-side GeoIP on all worker events (`worker_started`, `session_compressed`, `context_injected`, …). The client now passes `disableGeoip: false`, letting PostHog derive coarse location (country / region / city) at ingestion — from the request IP, which is then discarded. CLI events (`install_*`) were already unaffected.
+
+## Privacy
+
+- No change to the IP promise: raw IP addresses are still **never attached to events by the client and never stored** — the sender IP is used transiently at ingest for the coarse-location lookup, then discarded.
+- The telemetry docs (https://docs.claude-mem.ai/telemetry) and the `npx claude-mem telemetry enable` consent screen now disclose the ingest-derived coarse location.
+
+## Tests
+
+- New regression test asserts the PostHog client is constructed with `disableGeoip: false` (telemetry suite now 58 tests, all passing).
+
 ## [13.5.3] - 2026-06-10
 
 ## Telemetry: real data edition
