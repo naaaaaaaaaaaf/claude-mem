@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { logger } from '../../utils/logger.js';
 import { getProjectContext } from '../../utils/project-name.js';
-import { ChromaSync } from '../sync/ChromaSync.js';
+import { ChromaSync, MergedIntoProjectTarget } from '../sync/ChromaSync.js';
 import { emitRemapProject, hasSyncLane } from '../sync/remap-outbox.js';
 import { paths } from '../../shared/paths.js';
 import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
@@ -22,6 +22,16 @@ export interface AdoptionResult {
   chromaFailed: number;
   dryRun: boolean;
   errors: Array<{ worktree: string; error: string }>;
+}
+
+/**
+ * Render per-branch adoption errors as a string for logger CONTEXT values —
+ * the logger interpolates context values with a template literal
+ * (logger.ts `${k}=${v}`), so a raw object array renders as
+ * '[object Object]' (#3378).
+ */
+export function formatAdoptionErrors(errors: AdoptionResult['errors']): string {
+  return errors.map(e => `${e.worktree}: ${e.error}`).join('; ');
 }
 
 interface WorktreeEntry {
@@ -42,7 +52,8 @@ function gitCapture(cwd: string, args: string[]): string | null {
   const startTime = Date.now();
   const r = spawnSync('git', ['-C', cwd, ...args], {
     encoding: 'utf8',
-    timeout: GIT_TIMEOUT_MS
+    timeout: GIT_TIMEOUT_MS,
+    windowsHide: true
   });
   const duration = Date.now() - startTime;
   
@@ -179,7 +190,7 @@ export async function adoptMergedWorktrees(opts: {
     return result;
   }
 
-  const adoptedSqliteIds: number[] = [];
+  const adoptedChromaTargets: MergedIntoProjectTarget[] = [];
 
   let db: import('bun:sqlite').Database | null = null;
   try {
@@ -208,6 +219,11 @@ export async function adoptMergedWorktrees(opts: {
        WHERE project = ?
          AND (merged_into_project IS NULL OR merged_into_project = ?)`
     );
+    const selectSumForPatch = db.prepare(
+      `SELECT id FROM session_summaries
+       WHERE project = ?
+         AND (merged_into_project IS NULL OR merged_into_project = ?)`
+    );
     const updateObs = db.prepare(
       'UPDATE observations SET merged_into_project = ? WHERE project = ? AND merged_into_project IS NULL'
     );
@@ -229,6 +245,10 @@ export async function adoptMergedWorktrees(opts: {
         worktreeProject,
         parentProject
       ) as Array<{ id: number }>;
+      const summaryRows = selectSumForPatch.all(
+        worktreeProject,
+        parentProject
+      ) as Array<{ id: number }>;
 
       let obsChanges: number;
       let sumChanges: number;
@@ -244,7 +264,12 @@ export async function adoptMergedWorktrees(opts: {
         obsChanges = updateObs.run(parentProject, worktreeProject).changes;
         sumChanges = updateSum.run(parentProject, worktreeProject).changes;
       }
-      for (const r of rows) adoptedSqliteIds.push(r.id);
+      for (const r of rows) {
+        adoptedChromaTargets.push({ docType: 'observation', sqliteId: r.id });
+      }
+      for (const r of summaryRows) {
+        adoptedChromaTargets.push({ docType: 'session_summary', sqliteId: r.id });
+      }
       result.adoptedObservations += obsChanges;
       result.adoptedSummaries += sumChanges;
     };
@@ -285,27 +310,27 @@ export async function adoptMergedWorktrees(opts: {
     db?.close();
   }
 
-  if (!dryRun && adoptedSqliteIds.length > 0) {
+  if (!dryRun && adoptedChromaTargets.length > 0) {
     const chromaSync = new ChromaSync('claude-mem');
     try {
-      await chromaSync.updateMergedIntoProject(adoptedSqliteIds, parentProject);
-      result.chromaUpdates = adoptedSqliteIds.length;
+      await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
+      result.chromaUpdates = adoptedChromaTargets.length;
     } catch (err) {
       if (err instanceof Error) {
         logger.error(
           'SYSTEM',
           'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedSqliteIds.length },
+          { parentProject, sqliteIdCount: adoptedChromaTargets.length },
           err
         );
       } else {
         logger.error(
           'SYSTEM',
           'Worktree adoption Chroma patch failed (SQL already committed)',
-          { parentProject, sqliteIdCount: adoptedSqliteIds.length, error: String(err) }
+          { parentProject, sqliteIdCount: adoptedChromaTargets.length, error: String(err) }
         );
       }
-      result.chromaFailed = adoptedSqliteIds.length;
+      result.chromaFailed = adoptedChromaTargets.length;
     }
   }
 

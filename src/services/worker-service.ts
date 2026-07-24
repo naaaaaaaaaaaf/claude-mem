@@ -2,6 +2,7 @@
 import path from 'path';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
+import { pathToFileURL } from 'url';
 import type { Database } from 'bun:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -55,7 +56,7 @@ import {
   httpShutdown
 } from './infrastructure/HealthMonitor.js';
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
-import { adoptMergedWorktrees, adoptMergedWorktreesForAllKnownRepos } from './infrastructure/WorktreeAdoption.js';
+import { adoptMergedWorktrees, adoptMergedWorktreesForAllKnownRepos, formatAdoptionErrors } from './infrastructure/WorktreeAdoption.js';
 
 import { Server } from './server/Server.js';
 import { BetterAuthRoutes } from '../server/auth/BetterAuthRoutes.js';
@@ -475,25 +476,6 @@ export class WorkerService implements WorkerRef {
       logger.info('WORKER', 'Checking for one-time CWD remap...');
       runOneTimeCwdRemap();
 
-      logger.info('WORKER', 'Adopting merged worktrees (background)...');
-      adoptMergedWorktreesForAllKnownRepos({}).then(adoptions => {
-        if (adoptions) {
-          for (const adoption of adoptions) {
-            if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
-              logger.info('SYSTEM', 'Merged worktrees adopted in background', adoption);
-            }
-            if (adoption.errors.length > 0) {
-              logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
-                repoPath: adoption.repoPath,
-                errors: adoption.errors
-              });
-            }
-          }
-        }
-      }).catch(err => {
-        logger.error('WORKER', 'Worktree adoption failed (background)', {}, err instanceof Error ? err : new Error(String(err)));
-      });
-
       const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
       if (chromaEnabled) {
         this.chromaMcpManager = ChromaMcpManager.getInstance();
@@ -506,6 +488,30 @@ export class WorkerService implements WorkerRef {
       await this.dbManager.initialize();
 
       runOneTimeV12_4_3Cleanup();
+
+      // Worktree adoption stays fire-and-forget (#2122) — init never awaits
+      // it — but it is kicked only after dbManager.initialize() and the
+      // one-time cleanup above have finished: adoption writes through its own
+      // connection, and starting it earlier raced the boot-time migration
+      // writer for the single WAL writer slot ('database is locked', #3378).
+      logger.info('WORKER', 'Adopting merged worktrees (background)...');
+      adoptMergedWorktreesForAllKnownRepos({}).then(adoptions => {
+        if (adoptions) {
+          for (const adoption of adoptions) {
+            if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
+              logger.info('SYSTEM', 'Merged worktrees adopted in background', adoption);
+            }
+            if (adoption.errors.length > 0) {
+              logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
+                repoPath: adoption.repoPath,
+                errors: formatAdoptionErrors(adoption.errors)
+              });
+            }
+          }
+        }
+      }).catch(err => {
+        logger.error('WORKER', 'Worktree adoption failed (background)', {}, err instanceof Error ? err : new Error(String(err)));
+      });
 
       // Two-lane sync pull loop (plan Phase 3 task 3). Constructed only when
       // CloudSync is active AND resolved a device id (fail-closed identity —
@@ -924,6 +930,7 @@ function runServerServiceCli(command: string, extraArgs: string[] = []): void {
 
   const child = spawn(process.execPath, [serverScript, command, ...extraArgs], {
     stdio: 'inherit',
+    windowsHide: true,
     // Strip host CLI bleed-through (CLAUDE_CODE_*, including EFFORT_LEVEL) and
     // Anthropic credentials before handing env to the spawned daemon. The
     // daemon re-reads its own credentials from ~/.claude-mem/.env. See
@@ -1555,7 +1562,7 @@ function printQueueStatusIfBullMq(health: WorkerHealthSnapshot): void {
 
 const isMainModule = typeof require !== 'undefined' && typeof module !== 'undefined'
   ? require.main === module || !module.parent || process.env.CLAUDE_MEM_MANAGED === 'true'
-  : import.meta.url === `file://${process.argv[1]}`
+  : (Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href)
     || process.argv[1]?.endsWith('worker-service')
     || process.argv[1]?.endsWith('worker-service.cjs')
     || process.argv[1]?.replaceAll('\\', '/') === __filename?.replaceAll('\\', '/');
