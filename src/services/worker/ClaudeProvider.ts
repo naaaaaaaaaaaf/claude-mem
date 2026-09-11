@@ -214,8 +214,8 @@ export class ClaudeProvider {
     session.lastResultTotalCostUsd = null;
 
     const activeResponseContext = { current: snapshotResponseContext(session) };
-    const compressField: FieldCompressor = (text, budgetChars) =>
-      this.compressField(text, budgetChars, session, modelId, claudePath);
+    const compressField: FieldCompressor = (text, budgetChars, signal) =>
+      this.compressField(text, budgetChars, session, modelId, claudePath, signal);
     const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField);
 
     if (session.memorySessionId) {
@@ -237,13 +237,21 @@ export class ClaudeProvider {
       session.forceInit = false;
     }
 
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
     // waitForSlot reserves the slot it grants (#3287). The spawn factory
     // releases the reservation once the spawned process is a registry record;
     // the finally below covers every path where the spawn never happens
     // (OAuth failure, abort, query() throwing). release() is idempotent.
-    const slotReservation = await waitForSlot(maxConcurrent, session.abortController.signal);
+    //
+    // #2756: pass a thunk, not a frozen number — re-reads settings on every
+    // recheck so raising CLAUDE_MEM_MAX_CONCURRENT_AGENTS releases an
+    // already-parked waiter without a worker restart. sessionId lets
+    // SessionRoutes detect via isSessionParkedForSlot() whether this session
+    // is parked here (vs. mid-response) when the selected provider changes.
+    const slotReservation = await waitForSlot(
+      () => parseInt(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2,
+      session.abortController.signal,
+      session.sessionDbId
+    );
 
     try {
       const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
@@ -286,6 +294,17 @@ export class ClaudeProvider {
           spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId, slotReservation, observerExtraArgs),
         }),
       });
+
+      // Baseline for the next dispatched response's discovery-token delta.
+      // Textless frames are not dispatched (see below), so their usage rolls
+      // into the next dispatch instead of going unattributed.
+      let discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      // Whether the current turn has dispatched any text yet. A turn that ends
+      // without one still needs the idle hand-off, otherwise the claimed batch
+      // is left dangling for session teardown to discard.
+      let turnDispatchedText = false;
+      // One re-queue per generator pass for a batch a failed turn never read.
+      let retriedAfterErrorResult = false;
 
       for await (const message of queryResult) {
         // Quota-aware wall-clock guard (#2234): the SDK pushes
@@ -358,13 +377,24 @@ export class ClaudeProvider {
 
         if (message.type === 'assistant') {
           const content = message.message.content;
+          // A turn can arrive as several assistant messages, and a frame that
+          // holds only thinking or tool_use blocks carries no text at all.
+          // Flattening such a frame to '' and handing it to
+          // processAgentResponse makes the parser read the turn as idle and
+          // confirm-and-drop the claimed batch before the real XML frame
+          // arrives (#3492). A frame that does contain a text block still goes
+          // through even when that text is empty: that is the provider saying
+          // it had nothing to record, which stays a confirmed no-op batch. A
+          // turn that never produces a text frame gets the same idle hand-off
+          // once, from the `result` branch below.
+          const hasTextBlock = Array.isArray(content)
+            ? content.some((c: any) => c?.type === 'text')
+            : typeof content === 'string';
           const textContent = Array.isArray(content)
             ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
             : typeof content === 'string' ? content : '';
 
           const responseSize = textContent.length;
-
-          const tokensBeforeResponse = session.cumulativeInputTokens + session.cumulativeOutputTokens;
 
           const usage = message.message.usage;
           if (usage) {
@@ -395,7 +425,18 @@ export class ClaudeProvider {
             });
           }
 
-          const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - tokensBeforeResponse;
+          if (!hasTextBlock) {
+            logger.debug('SDK', 'Assistant frame carried no text block, leaving queued batch intact', {
+              sessionId: session.sessionDbId,
+              promptNumber: session.lastPromptNumber,
+              blockTypes: Array.isArray(content)
+                ? [...new Set(content.map((c: any) => String(c?.type)))].join(',')
+                : typeof content,
+            });
+            continue;
+          }
+
+          const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline;
 
           const originalTimestamp = session.earliestPendingTimestamp;
 
@@ -426,6 +467,9 @@ export class ClaudeProvider {
             modelId,
             activeResponseContext.current
           );
+
+          discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+          turnDispatchedText = true;
         }
 
         if (message.type === 'result') {
@@ -471,6 +515,47 @@ export class ClaudeProvider {
                   : undefined,
             });
           }
+
+          const resultSubtype = (message as any).subtype as string | undefined;
+          const resultIsError = (message as any).is_error === true || resultSubtype !== 'success';
+
+          // The turn is over and the model never emitted text. Only a
+          // successful turn means "the model read the batch and chose to skip
+          // it" — forward the empty response once so the claim is acknowledged
+          // instead of being retried forever. A failed turn never reached that
+          // judgement, so its batch goes back to the buffer for the drain to
+          // re-yield. Exactly one such retry per generator pass: a message is
+          // always pending while a batch is re-queued, so the buffer never
+          // idles out, and an endlessly failing turn would spin on it.
+          if (!turnDispatchedText) {
+            if (resultIsError && !retriedAfterErrorResult) {
+              retriedAfterErrorResult = true;
+              logger.warn('SDK', 'SDK turn failed before emitting text, re-queueing the claimed batch', {
+                sessionId: session.sessionDbId,
+                subtype: resultSubtype,
+              });
+              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+            } else {
+              await processAgentResponse(
+                '',
+                session,
+                this.dbManager,
+                this.sessionManager,
+                worker,
+                (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline,
+                session.earliestPendingTimestamp,
+                'SDK',
+                cwdTracker.lastCwd,
+                modelId,
+                activeResponseContext.current
+              );
+              discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+            }
+          }
+          if (!resultIsError) {
+            retriedAfterErrorResult = false;
+          }
+          turnDispatchedText = false;
         }
       }
     } finally {
@@ -510,35 +595,48 @@ export class ClaudeProvider {
     session: ActiveSession,
     modelId: string,
     claudePath: string,
+    signal: AbortSignal,
   ): Promise<string | null> {
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
-    const result = query({
-      prompt: buildFieldCompressionPrompt(text, budgetChars),
-      options: {
-        ...buildHardenedSdkOptions({
-          source: 'Observer',
-          sessionDbId: session.sessionDbId,
-          contentSessionId: session.contentSessionId,
-          project: session.project,
-          model: modelId,
-          env: isolatedEnv,
-          pathToClaudeCodeExecutable: claudePath,
-          abortController: session.abortController,
-        }),
-        maxTurns: 1,
-      },
-    });
-
-    let out = '';
-    for await (const message of result) {
-      if (message.type === 'assistant') {
-        const content = (message as any).message.content;
-        out += Array.isArray(content)
-          ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-          : typeof content === 'string' ? content : '';
-      }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const signals = [signal, session.abortController.signal];
+    for (const source of signals) {
+      source.addEventListener('abort', abort, { once: true });
+      if (source.aborted) abort();
     }
-    return out || null;
+    try {
+      if (controller.signal.aborted) return null;
+      const result = query({
+        prompt: buildFieldCompressionPrompt(text, budgetChars),
+        options: {
+          ...buildHardenedSdkOptions({
+            source: 'Observer',
+            sessionDbId: session.sessionDbId,
+            contentSessionId: session.contentSessionId,
+            project: session.project,
+            model: modelId,
+            env: isolatedEnv,
+            pathToClaudeCodeExecutable: claudePath,
+            abortController: controller,
+          }),
+          maxTurns: 1,
+        },
+      });
+
+      let out = '';
+      for await (const message of result) {
+        if (message.type === 'assistant') {
+          const content = (message as any).message.content;
+          out += Array.isArray(content)
+            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : typeof content === 'string' ? content : '';
+        }
+      }
+      return out || null;
+    } finally {
+      for (const source of signals) source.removeEventListener('abort', abort);
+    }
   }
 
   private async *createMessageGenerator(

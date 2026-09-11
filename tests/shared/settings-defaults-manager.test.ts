@@ -501,6 +501,21 @@ describe('SettingsDefaultsManager', () => {
       expect(defaults.CLAUDE_MEM_DATA_DIR).toBeDefined();
       expect(defaults.CLAUDE_MEM_LOG_LEVEL).toBeDefined();
     });
+
+    // #2753 — new key: empty by default (fall through to
+    // process.env.CLAUDE_CONFIG_DIR/default in oauth-token.ts's
+    // resolveEffectiveClaudeConfigDir), overridable via file or env like any
+    // other setting (the generic per-key loops in loadFromFile/
+    // applyEnvOverrides need no key-specific code).
+    it('CLAUDE_MEM_CLAUDE_CONFIG_DIR defaults to empty string', () => {
+      expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_CLAUDE_CONFIG_DIR).toBe('');
+    });
+
+    it('cloud sync content flush knobs default to 40 ops / 90s', () => {
+      const defaults = SettingsDefaultsManager.getAllDefaults();
+      expect(defaults.CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE).toBe('40');
+      expect(defaults.CLAUDE_MEM_CLOUD_SYNC_REQUEST_TIMEOUT_MS).toBe('90000');
+    });
   });
 
   describe('get', () => {
@@ -564,6 +579,28 @@ describe('SettingsDefaultsManager', () => {
       const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
       expect(result.CLAUDE_MEM_WORKER_PORT).toBe('99999');
+    });
+
+    // #2753 — CLAUDE_MEM_CLAUDE_CONFIG_DIR is overridable via the file and
+    // via CLAUDE_MEM_CLAUDE_CONFIG_DIR env, same as any other key (no
+    // key-specific code was added — the generic loops already handle it).
+    it('CLAUDE_MEM_CLAUDE_CONFIG_DIR: file value is honored, and env overrides the file', () => {
+      const originalConfigDirEnv = process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR;
+      try {
+        delete process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR;
+        writeFileSync(settingsPath, JSON.stringify({ CLAUDE_MEM_CLAUDE_CONFIG_DIR: '/from/file' }));
+
+        expect(SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_CLAUDE_CONFIG_DIR).toBe('/from/file');
+
+        process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR = '/from/env';
+        expect(SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_CLAUDE_CONFIG_DIR).toBe('/from/env');
+      } finally {
+        if (originalConfigDirEnv === undefined) {
+          delete process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR;
+        } else {
+          process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR = originalConfigDirEnv;
+        }
+      }
     });
 
     it('should use file setting when env var is not set', () => {

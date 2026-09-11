@@ -15,12 +15,22 @@ function formatHostForUrl(host: string): string {
   return host.includes(':') ? `[${host}]` : host;
 }
 
+// Probes against a ghost listener (plan-15 #3603) can connect — the kernel
+// completes handshakes on the inherited socket — but never receive a response,
+// because no application is reading. An unbounded fetch would hang the probe
+// forever, so every HTTP probe is aborted after this budget. 5s is above a
+// healthy worker's sub-100ms response and below every caller's retry budget.
+const HEALTH_PROBE_TIMEOUT_MS = 5_000;
+
 async function httpRequestToWorker(
   port: number,
   endpointPath: string,
   method: string = 'GET'
 ): Promise<{ ok: boolean; statusCode: number; body: string }> {
-  const response = await fetch(`http://${formatHostForUrl(getWorkerHost())}:${port}${endpointPath}`, { method });
+  const response = await fetch(`http://${formatHostForUrl(getWorkerHost())}:${port}${endpointPath}`, {
+    method,
+    signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+  });
   let body = '';
   try {
     body = await response.text();
@@ -35,8 +45,19 @@ export async function isPortInUse(port: number): Promise<boolean> {
     // Fast path: HTTP health check. A live claude-mem worker responds to
     // /api/health, so this is the cheapest non-disruptive probe for the
     // common case (worker is running and healthy).
+    //
+    // Bounded like every other probe (HEALTH_PROBE_TIMEOUT_MS): a ghost
+    // listener — the dead worker's inherited socket, held open by its chroma
+    // sidecar chain (plan-15 #3603) — completes the TCP handshake and then
+    // never answers. Unbounded, this fetch would hang forever, and with it
+    // ensureWorkerStarted(), which calls this BEFORE it can reach the reclaim:
+    // the very bug the reclaim exists to fix would instead wedge every
+    // launcher. On timeout the flow falls through to the socket probe below,
+    // which still reports a bound port as in use.
     try {
-      const response = await fetch(`http://${formatHostForUrl(getWorkerHost())}:${port}/api/health`);
+      const response = await fetch(`http://${formatHostForUrl(getWorkerHost())}:${port}/api/health`, {
+        signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+      });
       if (response.ok) return true;
       // Non-ok response: port is reachable but the worker is unhealthy.
       // Fall through to the net.createServer check below so we still report
