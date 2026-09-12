@@ -181,7 +181,13 @@ export class ChromaMcpManager {
         throw error;
       }
       this.lastConnectionFailureTimestamp = Date.now();
-      if (error instanceof Error) {
+      if (error instanceof ChromaUnavailableError) {
+        // Chroma being unavailable is transient and already handled downstream
+        // (reconnect backoff + skip-the-write). Log at warn so it does not route
+        // through the error sink (captureException) and flood error tracking on
+        // every reconnect.
+        logger.warn('CHROMA_MCP', 'Connection attempt failed; Chroma unavailable', { error: error.message });
+      } else if (error instanceof Error) {
         logger.error('CHROMA_MCP', 'Connection attempt failed', {}, error);
       } else {
         logger.error('CHROMA_MCP', 'Connection attempt failed with non-Error value', { error: String(error) });
@@ -296,7 +302,16 @@ export class ChromaMcpManager {
       // Tree-kill (not just transport.close) so failed-connect descendants
       // can't survive on Linux (#2313).
       await this.disposeCurrentSubprocess();
-      throw connectionError;
+      // A failed MCP handshake means Chroma is unavailable, the same as a
+      // missing uvx, a failed prewarm, or a lost writer lock. The SDK sends
+      // `notifications/initialized` right after `initialize`; when the
+      // subprocess dies mid-handshake that send throws a bare
+      // `Error: Not connected`. Classify every connect failure as
+      // ChromaUnavailableError so callers take the reconnect-backoff and
+      // skip-the-write path instead of surfacing a raw error to error tracking.
+      const unavailableMessage = `chroma-mcp connection failed: ${connectionError instanceof Error ? connectionError.message : String(connectionError)}`;
+      recordChromaVectorSearchUnavailable(unavailableMessage);
+      throw new ChromaUnavailableError(unavailableMessage, connectionError instanceof Error ? connectionError : undefined);
     }
     clearTimeout(timeoutId!);
 
@@ -1493,6 +1508,13 @@ export class ChromaMcpManager {
     // Disable Chroma's anonymous telemetry — it issues background HTTP from
     // the embedding subprocess on every collection touch.
     if (!baseEnv.ANONYMIZED_TELEMETRY) baseEnv.ANONYMIZED_TELEMETRY = 'false';
+
+    // Force UTF-8 on the Python child's stdio. Without this, a non-UTF-8 ANSI
+    // code page (e.g. cp936) makes Python encode JSON-RPC stdout in the locale
+    // encoding, which Node then decodes as UTF-8 — the bad bytes become U+FFFD
+    // and JSON.parse throws. These vars govern both directions of the pipe.
+    baseEnv.PYTHONUTF8 = '1';
+    baseEnv.PYTHONIOENCODING = 'utf-8';
     return baseEnv;
   }
 

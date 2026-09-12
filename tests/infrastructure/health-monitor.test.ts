@@ -250,6 +250,29 @@ describe('HealthMonitor', () => {
       expect(elapsed).toBeLessThan(2500);
     });
 
+    // #3575 leftover after plan-15 already bounded each probe at 5s: a hung
+    // fetch must still honor the *caller* deadline, not sit out the full
+    // HEALTH_PROBE_TIMEOUT_MS. Without the remaining-ms cap, waitForHealth(100)
+    // would block ~5s inside AbortSignal.timeout.
+    it('should abort a fetch that never responds within the overall timeout', async () => {
+      global.fetch = mock((_input: RequestInfo | URL, init?: RequestInit) => new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) {
+          reject(new Error('expected an abort signal'));
+          return;
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }));
+
+      const start = Date.now();
+      const result = await waitForHealth(39999, 100);
+      const elapsed = Date.now() - start;
+
+      expect(result).toBe(false);
+      expect(elapsed).toBeGreaterThanOrEqual(90);
+      expect(elapsed).toBeLessThan(500);
+    });
+
     it('should succeed after server becomes available', async () => {
       let callCount = 0;
       global.fetch = mock(() => {
@@ -286,6 +309,23 @@ describe('HealthMonitor', () => {
     });
 
     it('should honor configured worker host when polling health', async () => {
+      process.env.CLAUDE_MEM_WORKER_HOST = '127.0.0.2';
+      const fetchMock = mock(() => Promise.resolve({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve('')
+      } as unknown as Response));
+      global.fetch = fetchMock;
+
+      await waitForHealth(37777, 1000);
+
+      expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.2:37777/api/health');
+    });
+
+    it('should normalize a localhost worker host to 127.0.0.1 when polling health', async () => {
+      // 'localhost' resolves IPv6-first on modern Windows while the worker
+      // binds a single family, so SettingsDefaultsManager pins it to the
+      // IPv4 loopback (#2992) — the poll URL must reflect that.
       process.env.CLAUDE_MEM_WORKER_HOST = 'localhost';
       const fetchMock = mock(() => Promise.resolve({
         ok: true,
@@ -296,7 +336,7 @@ describe('HealthMonitor', () => {
 
       await waitForHealth(37777, 1000);
 
-      expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:37777/api/health');
+      expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:37777/api/health');
     });
 
     it('should use default timeout when not specified', async () => {
