@@ -57,6 +57,7 @@ mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
 
 import { ChromaSync } from '../../../src/services/sync/ChromaSync.js';
 import { ChromaSyncState } from '../../../src/services/sync/ChromaSyncState.js';
+import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 import { logger } from '../../../src/utils/logger.js';
 
 afterAll(() => {
@@ -89,18 +90,60 @@ function makeStore(project: string, observationIds: number[]) {
   return makeStoreFromRows(project, observationRows);
 }
 
-function makeStoreFromRows(project: string, observationRows: ReturnType<typeof makeObservationRow>[]) {
+function makeSummaryRow(id: number, project: string) {
+  return {
+    id,
+    memory_session_id: `mem-${id}`,
+    project,
+    merged_into_project: null,
+    platform_source: 'claude',
+    request: `Request ${id}`,
+    investigated: null,
+    learned: null,
+    completed: null,
+    next_steps: null,
+    notes: null,
+    prompt_number: id,
+    created_at_epoch: 1_700_000_000_000 + id,
+  };
+}
+
+function makePromptRow(id: number, project: string) {
+  return {
+    id,
+    content_session_id: `sess-${id}`,
+    prompt_number: id,
+    prompt_text: `Prompt ${id}`,
+    created_at_epoch: 1_700_000_000_000 + id,
+    memory_session_id: `mem-${id}`,
+    project,
+    platform_source: 'claude',
+  };
+}
+
+function makeStoreFromRows(
+  project: string,
+  observationRows: ReturnType<typeof makeObservationRow>[],
+  summaryRows: ReturnType<typeof makeSummaryRow>[] = [],
+  promptRows: ReturnType<typeof makePromptRow>[] = [],
+) {
 
   return {
     db: {
       prepare(query: string) {
         return {
           all: (...params: Array<string | number>) => {
+            // The one-time title-only requeue: bodiless rows at or below the watermark.
+            if (query.includes("COALESCE(narrative, '') = ''")) {
+              const watermark = Number(params[1] ?? 0);
+              return observationRows.filter(row => row.id <= watermark && !row.narrative && !row.text);
+            }
+
             if (query.includes('SELECT id') && query.includes('FROM observations') && !query.includes('LEFT JOIN')) {
               return observationRows.map(row => ({ id: row.id }));
             }
 
-            if (query.includes('SELECT DISTINCT project FROM observations')) {
+            if (query.includes('SELECT DISTINCT project FROM')) {
               return [{ project }];
             }
 
@@ -115,11 +158,21 @@ function makeStoreFromRows(project: string, observationRows: ReturnType<typeof m
             }
 
             if (query.includes('FROM session_summaries')) {
-              return [];
+              const pendingSummaryIds = params.slice(1).filter((value): value is number => typeof value === 'number');
+              if (query.includes('IN (')) {
+                return summaryRows.filter(row => pendingSummaryIds.includes(row.id));
+              }
+              const watermark = Number(params[1] ?? 0);
+              return summaryRows.filter(row => row.id > watermark);
             }
 
             if (query.includes('FROM user_prompts')) {
-              return [];
+              const pendingPromptIds = params.slice(1).filter((value): value is number => typeof value === 'number');
+              if (query.includes('IN (')) {
+                return promptRows.filter(row => pendingPromptIds.includes(row.id));
+              }
+              const watermark = Number(params[1] ?? 0);
+              return promptRows.filter(row => row.id > watermark);
             }
 
             return [];
@@ -130,11 +183,11 @@ function makeStoreFromRows(project: string, observationRows: ReturnType<typeof m
             }
 
             if (query.includes('COUNT(*) as count FROM session_summaries')) {
-              return { count: 0 };
+              return { count: summaryRows.length };
             }
 
             if (query.includes('COUNT(*) as count') && query.includes('FROM user_prompts')) {
-              return { count: 0 };
+              return { count: promptRows.length };
             }
 
             return { count: 0 };
@@ -371,7 +424,7 @@ describe('ChromaSync watermark gap persistence', () => {
       expect(ChromaSyncState.get(project).observations).toBe(1);
       expect(ChromaSyncState.getPending(project, 'observations')).toEqual([]);
       expect(infoSpy.mock.calls.some(([, message]) => message === 'Smart backfill complete')).toBe(false);
-      expect(completed).toBe(false);
+      expect(completed).toBe('shutdown');
     } finally {
       infoSpy.mockRestore();
     }
@@ -397,7 +450,7 @@ describe('ChromaSync watermark gap persistence', () => {
     expect(attempts).toBe(1);
     expect(ChromaSyncState.get(project).observations).toBe(0);
     expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1]);
-    expect(completed).toBe(false);
+    expect(completed).toBe('shutdown');
   });
 
   it('does not report a run complete when shutdown refuses the last row\'s write (#4069)', async () => {
@@ -414,7 +467,7 @@ describe('ChromaSync watermark gap persistence', () => {
 
     expect(ChromaSyncState.get(project).observations).toBe(0);
     expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1]);
-    expect(completed).toBe(false);
+    expect(completed).toBe('shutdown');
   });
 
   it('does not create the collection once shutdown has begun (#4069)', async () => {
@@ -423,7 +476,7 @@ describe('ChromaSync watermark gap persistence', () => {
     const completed = await new ChromaSync(project).ensureBackfilled(project, makeStore(project, [1]));
 
     expect(createCollectionCalls).toBe(0);
-    expect(completed).toBe(false);
+    expect(completed).toBe('shutdown');
   });
 
   it('stops a backfill when shutdown refuses the collection creation in flight (#4069)', async () => {
@@ -437,7 +490,7 @@ describe('ChromaSync watermark gap persistence', () => {
 
     expect(addDocumentCalls).toEqual([]);
     expect(ChromaSyncState.get(project).observations).toBe(0);
-    expect(completed).toBe(false);
+    expect(completed).toBe('shutdown');
   });
 
   it('still rejects when the collection cannot be created for another reason', async () => {
@@ -475,7 +528,7 @@ describe('ChromaSync watermark gap persistence', () => {
     const store = {
       db: {
         prepare(query: string) {
-          if (query.includes('SELECT DISTINCT project FROM observations')) {
+          if (query.includes('SELECT DISTINCT project FROM')) {
             return { all: () => [{ project }, { project: `${project}-b` }, { project: `${project}-c` }] };
           }
           return base.db.prepare(query);
@@ -504,7 +557,7 @@ describe('ChromaSync watermark gap persistence', () => {
   it('reports a finished backfill as complete', async () => {
     const sync = new ChromaSync(project);
 
-    expect(await sync.ensureBackfilled(project, makeStore(project, [1, 2]))).toBe(true);
+    expect(await sync.ensureBackfilled(project, makeStore(project, [1, 2]))).toBe('completed');
     expect(ChromaSyncState.get(project).observations).toBe(2);
   });
 
@@ -655,5 +708,236 @@ describe('ChromaSync watermark gap persistence', () => {
     expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secretFact);
     expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(malformedSecretFact);
     expect(ChromaSyncState.get(project).observations).toBe(malformedRowId);
+  });
+});
+
+describe('ChromaSync title-only rows and truthful backfill outcomes (#4069)', () => {
+  const project = `title-only-${Date.now()}`;
+
+  beforeEach(() => {
+    process.env.CLAUDE_MEM_DATA_DIR = mkdtempSync(join(tmpdir(), 'claude-mem-title-only-'));
+    existingObservationIds = new Set<number>();
+    acceptingMutations = true;
+    createCollectionCalls = 0;
+    onCreateCollection = null;
+    addDocumentCalls.length = 0;
+    addDocumentPayloads.length = 0;
+    ChromaSyncState.replace(project, { observations: 0, summaries: 0, prompts: 0, pending: {} });
+  });
+
+  function titleOnlyRow(id: number, subtitle: string | null = null) {
+    return { ...makeObservationRow(id, project), narrative: null, text: null, facts: '[]', subtitle };
+  }
+
+  function emptyRow(id: number) {
+    return { ...titleOnlyRow(id), title: null as unknown as string };
+  }
+
+  it('indexes a title-only observation as one title document and advances the watermark', async () => {
+    const sync = new ChromaSync(project);
+
+    expect(await sync.ensureBackfilled(project, makeStoreFromRows(project, [titleOnlyRow(1, 'the subtitle')])))
+      .toBe('completed');
+
+    expect(addDocumentPayloads).toHaveLength(1);
+    expect(addDocumentPayloads[0].ids).toEqual(['obs_1_title']);
+    expect(addDocumentPayloads[0].documents).toEqual(['Observation 1\nthe subtitle']);
+    expect(addDocumentPayloads[0].metadatas[0]).toMatchObject({ field_type: 'title', sqlite_id: 1 });
+    expect(ChromaSyncState.get(project).observations).toBe(1);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([]);
+  });
+
+  it('indexes a title-only observation on the live path too', async () => {
+    const sync = new ChromaSync(project);
+
+    await sync.syncObservation(5, 'mem-5', project, {
+      type: 'discovery',
+      title: 'Only a title',
+      subtitle: null,
+      facts: [],
+      narrative: null,
+      concepts: [],
+      files_read: [],
+      files_modified: [],
+    } as any, 5, 1_700_000_000_005, 'claude');
+
+    expect(addDocumentCalls.flat()).toEqual(['obs_5_title']);
+    expect(ChromaSyncState.get(project).observations).toBe(5);
+  });
+
+  it('drains rows with no title and no body, and counts them', async () => {
+    const infoSpy = spyOn(logger, 'info');
+    try {
+      const sync = new ChromaSync(project);
+
+      expect(await sync.ensureBackfilled(project, makeStoreFromRows(project, [emptyRow(1), emptyRow(2)])))
+        .toBe('completed');
+
+      expect(addDocumentCalls).toEqual([]);
+      expect(ChromaSyncState.get(project).observations).toBe(2);
+      expect(ChromaSyncState.getPending(project, 'observations')).toEqual([]);
+      const completion = infoSpy.mock.calls.find(([, message]) => message === 'Smart backfill complete');
+      expect(completion?.[2]).toMatchObject({ emptyRows: 2 });
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('requeues title-only rows an older version skipped below the watermark, once', async () => {
+    // An older version advanced the watermark to 3 while writing nothing for
+    // title-only row 2: it is neither indexed nor pending.
+    ChromaSyncState.replace(project, { observations: 3, summaries: 0, prompts: 0, pending: {} });
+    const rows = [makeObservationRow(1, project), titleOnlyRow(2), makeObservationRow(3, project)];
+    const store = makeStoreFromRows(project, rows);
+    const sync = new ChromaSync(project);
+
+    expect(await sync.ensureBackfilled(project, store)).toBe('completed');
+
+    expect(addDocumentCalls).toEqual([['obs_2_title']]);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([]);
+    expect(ChromaSyncState.isTitleOnlyRequeued(project)).toBe(true);
+
+    // The requeue runs once per project, not on every sweep.
+    expect(await sync.ensureBackfilled(project, store)).toBe('completed');
+    expect(addDocumentCalls).toEqual([['obs_2_title']]);
+  });
+
+  it('reports write_failures on repeated write failures without advancing the watermark', async () => {
+    const store = makeStoreFromRows(project, [1, 2, 3].map(id => makeObservationRow(id, project)));
+    const sync = new ChromaSync(project) as ChromaSync & {
+      addDocuments: (documents: Array<{ id: string }>) => Promise<number>;
+    };
+    sync.addDocuments = async () => 0; // Chroma refusing writes
+
+    expect(await sync.ensureBackfilled(project, store)).toBe('write_failures');
+    // Nothing landed: the watermark must not advance past unwritten rows.
+    expect(ChromaSyncState.get(project).observations).toBe(0);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1, 2, 3]);
+  });
+
+  it('reports rows_pending when an isolated row fails but later rows succeed', async () => {
+    const store = makeStoreFromRows(project, [1, 2, 3].map(id => makeObservationRow(id, project)));
+    const sync = new ChromaSync(project) as ChromaSync & {
+      addDocuments: (documents: Array<{ id: string }>) => Promise<number>;
+    };
+    let calls = 0;
+    // Only the first row's batch fails; the rest land. The failed row stays
+    // pending for the next run, and the project must not be claimed complete.
+    sync.addDocuments = async (documents) => {
+      calls += 1;
+      return calls === 1 ? 0 : documents.length;
+    };
+
+    expect(await sync.ensureBackfilled(project, store)).toBe('rows_pending');
+    expect(ChromaSyncState.get(project).observations).toBe(3);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1]);
+  });
+
+  it('still backfills summaries and prompts after an isolated observation write failure', async () => {
+    const store = makeStoreFromRows(
+      project,
+      [1, 2, 3].map(id => makeObservationRow(id, project)),
+      [1, 2].map(id => makeSummaryRow(id, project)),
+      [1, 2].map(id => makePromptRow(id, project)),
+    );
+    const sync = new ChromaSync(project) as ChromaSync & {
+      addDocuments: (documents: Array<{ id: string }>) => Promise<number>;
+    };
+    let failFirstBatch = true;
+    let calls = 0;
+    const attemptedIds: string[] = [];
+    // Only the first batch (observation row 1) fails; every later batch lands,
+    // including the summary and prompt batches that follow it in the pipeline.
+    sync.addDocuments = async (documents) => {
+      calls += 1;
+      attemptedIds.push(...documents.map(document => document.id));
+      if (failFirstBatch && calls === 1) {
+        return 0;
+      }
+      return documents.length;
+    };
+
+    expect(await sync.ensureBackfilled(project, store)).toBe('rows_pending');
+    expect(ChromaSyncState.get(project).observations).toBe(3);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1]);
+    // The isolated observation failure must not stop the rest of the pipeline.
+    expect(ChromaSyncState.get(project).summaries).toBe(2);
+    expect(ChromaSyncState.get(project).prompts).toBe(2);
+    expect(attemptedIds).toContain('summary_1_request');
+    expect(attemptedIds).toContain('prompt_1');
+
+    // The next sweep retries the failed observation; with writes healthy the
+    // project then reports completed.
+    failFirstBatch = false;
+    expect(await sync.ensureBackfilled(project, store)).toBe('completed');
+    expect(ChromaSyncState.get(project).observations).toBe(3);
+    expect(ChromaSyncState.getPending(project, 'observations')).toEqual([]);
+  });
+
+  it('keeps one project\'s write failures from stopping another project running alongside it', async () => {
+    // Several projects share one ChromaSync instance during a sweep, so the
+    // abort must not live on the instance.
+    const failing = `${project}-failing`;
+    ChromaSyncState.replace(failing, { observations: 0, summaries: 0, prompts: 0, pending: {} });
+    const sync = new ChromaSync('claude-mem') as ChromaSync & {
+      addDocuments: (documents: Array<{ id: string; metadata: { project?: unknown } }>) => Promise<number>;
+    };
+    sync.addDocuments = async (documents) => (documents[0]?.metadata.project === failing ? 0 : documents.length);
+
+    // The healthy project has more rows than the failing one needs to give up,
+    // so it is still running when the other project aborts.
+    const [failed, completed] = await Promise.all([
+      sync.ensureBackfilled(failing, makeStoreFromRows(failing, [1, 2, 3].map(id => makeObservationRow(id, failing)))),
+      sync.ensureBackfilled(project, makeStoreFromRows(project, [1, 2, 3, 4, 5, 6].map(id => makeObservationRow(id, project)))),
+    ]);
+
+    expect(failed).toBe('write_failures');
+    expect(completed).toBe('completed');
+    expect(ChromaSyncState.get(project).observations).toBe(6);
+  });
+});
+
+describe('ChromaSync backfill project enumeration (#4069)', () => {
+  it('backfills projects that only have summaries, only prompts, or an empty project name', async () => {
+    process.env.CLAUDE_MEM_DATA_DIR = mkdtempSync(join(tmpdir(), 'claude-mem-enumeration-'));
+    // An existing state file skips the one-time bootstrap from Chroma.
+    ChromaSyncState.replace('enumeration-seed', { observations: 0, summaries: 0, prompts: 0 });
+    acceptingMutations = true;
+
+    const store = new SessionStore(':memory:');
+    const seen: string[] = [];
+    const ensureSpy = spyOn(ChromaSync.prototype, 'ensureBackfilled').mockImplementation(async (project: string) => {
+      seen.push(project);
+      return 'completed';
+    });
+    const observation = {
+      type: 'discovery', title: 'A title', subtitle: null, facts: [], narrative: 'A narrative',
+      concepts: [], files_read: [], files_modified: [],
+    };
+    function session(contentSessionId: string, project: string, memorySessionId: string): void {
+      store.updateMemorySessionId(store.createSDKSession(contentSessionId, project, 'first prompt'), memorySessionId);
+    }
+
+    try {
+      session('content-obs', 'obs-only', 'mem-obs');
+      store.storeObservation('mem-obs', 'obs-only', observation);
+      // The summary's project differs from its session's, so only session_summaries names it.
+      session('content-sum', 'summary-session', 'mem-sum');
+      store.storeSummary('mem-sum', 'summary-only', {
+        request: 'r', investigated: 'i', learned: 'l', completed: 'c', next_steps: 'n', notes: null,
+      });
+      // Only a session-joined prompt names this project.
+      session('content-prompt', 'prompt-only', 'mem-prompt');
+      store.saveUserPrompt('content-prompt', 1, 'a prompt');
+      session('content-empty', 'empty-session', 'mem-empty');
+      store.storeObservation('mem-empty', '', observation);
+
+      expect(await ChromaSync.backfillAllProjects(store)).toBe(true);
+
+      expect(seen).toEqual(expect.arrayContaining(['obs-only', 'summary-only', 'prompt-only', '']));
+    } finally {
+      ensureSpy.mockRestore();
+      store.close();
+    }
   });
 });

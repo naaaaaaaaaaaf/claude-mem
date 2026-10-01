@@ -87,6 +87,20 @@ export function formatDate(dateInput: string | number): string {
   );
 }
 
+/**
+ * The system locale's date and time, exactly as a bare toLocaleString() prints
+ * it, for records that can be from any year (search results, session context).
+ * Guarded like the helpers above: on a host whose formatter cannot initialize,
+ * an ISO date and a UTC clock.
+ */
+export function formatSystemLocaleDateTime(dateInput: string | number): string {
+  const date = new Date(dateInput);
+  return safeFormat(
+    () => date.toLocaleString(),
+    () => guardInvalid(date, d => `${isoDay(d)} ${isoClock(d)} UTC`)
+  );
+}
+
 export function formatHeaderDateTime(now: Date = new Date()): string {
   return safeFormat(
     () => {
@@ -135,10 +149,23 @@ export function estimateTokens(text: string | null): number {
   return Math.ceil(text.length / 4);
 }
 
+export interface GroupByDateOptions {
+  /**
+   * Order of the day groups:
+   * - 'asc' (default): oldest day first.
+   * - 'desc': newest day first, for date_desc results.
+   * - 'first-seen': the order in which each day's first item appears in `items`, so a
+   *   relevance-ordered input stays relevance-ordered across day headers.
+   */
+  order?: 'asc' | 'desc' | 'first-seen';
+}
+
 export function groupByDate<T>(
   items: T[],
-  getDate: (item: T) => string
+  getDate: (item: T) => string,
+  options: GroupByDateOptions = {}
 ): Map<string, T[]> {
+  const { order = 'asc' } = options;
   const itemsByDay = new Map<string, T[]>();
   for (const item of items) {
     const itemDate = getDate(item);
@@ -149,10 +176,14 @@ export function groupByDate<T>(
     itemsByDay.get(day)!.push(item);
   }
 
+  if (order === 'first-seen') {
+    return itemsByDay;
+  }
+
   const sortedEntries = Array.from(itemsByDay.entries()).sort((a, b) => {
     const aDate = new Date(a[0]).getTime();
     const bDate = new Date(b[0]).getTime();
-    return aDate - bDate;
+    return order === 'desc' ? bDate - aDate : aDate - bDate;
   });
 
   return new Map(sortedEntries);
