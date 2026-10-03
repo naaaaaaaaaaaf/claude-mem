@@ -29,6 +29,13 @@ import {
   type UpsertToolUseInput,
   type ToolUseQueryFilters,
 } from './tool-uses.js';
+import {
+  createWorkStateSchema,
+  appendWorkStateEntry as appendWorkStateEntryRow,
+  getWorkStateEntries as getWorkStateEntriesRows,
+  type WorkStateEntry,
+  type WorkStateFields,
+} from './work-state.js';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import {
   computeTitleNormKey, findTier0Canonical, bumpTokenDf, isFuzzyReady, recordTier1Candidates,
@@ -266,6 +273,7 @@ export class SessionStore {
     this.ensureAdvisorCallsTable();
     this.ensureSessionProjectKeySourceColumn();
     this.requeuePromptsDeadLetteredForSize();
+    this.ensureWorkStateTable();
   }
 
   private getIndexColumns(indexName: string): string[] {
@@ -914,6 +922,28 @@ export class SessionStore {
         raw_body TEXT,
         created_at_epoch INTEGER NOT NULL,
         UNIQUE(lane, queue_key, entity_rev, reason)
+      )
+    `);
+    // Pull-side counterpart: hub ops this device can never apply (malformed,
+    // equal-revision hash conflict, violated constraint), set aside by
+    // SyncApply so the cursor moves past them instead of wedging. retryable
+    // = 1 marks constraint violations SyncApply re-tries after each batch.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS sync_pull_quarantine (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch TEXT NOT NULL,
+        seq TEXT NOT NULL,
+        kind TEXT,
+        entity_id TEXT,
+        origin_device_id TEXT,
+        origin_local_id TEXT,
+        entity_rev TEXT,
+        operation_sha256 TEXT,
+        reason TEXT NOT NULL,
+        raw_body TEXT NOT NULL,
+        retryable INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+        created_at_epoch INTEGER NOT NULL,
+        UNIQUE(epoch, seq)
       )
     `);
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)')
@@ -1933,6 +1963,13 @@ export class SessionStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(51, new Date().toISOString());
   }
 
+  // v61 — the agent's to-do lists and working state (./work-state.ts). Idempotent
+  // DDL like v51, so fresh and migrating databases converge.
+  private ensureWorkStateTable(): void {
+    createWorkStateSchema(this.db);
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(61, new Date().toISOString());
+  }
+
   // v52 — durable claim ledger for one Telegram session wrap-up per route.
   // The DDL is intentionally idempotent so fresh installs and existing DBs
   // converge even if a fixture has an incomplete schema_versions ledger.
@@ -2947,6 +2984,14 @@ export class SessionStore {
 
   queryToolUses(filters: ToolUseQueryFilters = {}): ToolUseRow[] {
     return queryToolUsesRows(this.db, filters);
+  }
+
+  appendWorkStateEntry(entry: { project: string; listName: string; fields: WorkStateFields; createdAtEpoch?: number }): number {
+    return appendWorkStateEntryRow(this.db, entry);
+  }
+
+  getWorkStateEntries(projects: string[], listName?: string): WorkStateEntry[] {
+    return getWorkStateEntriesRows(this.db, projects, listName);
   }
 
   countToolUses(filters: ToolUseQueryFilters = {}): Array<{ tool_name: string; uses: number }> {
