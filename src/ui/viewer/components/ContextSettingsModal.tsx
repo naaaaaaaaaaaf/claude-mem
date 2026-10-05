@@ -241,7 +241,8 @@ export function ContextSettingsModal({
           </div>
 
           {/* Right column - Settings Panel */}
-          <div className="settings-column">
+          <fieldset className="settings-column" disabled={isSaving}
+            style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
             {/* Section 1: Loading */}
             <CollapsibleSection
               title="Loading"
@@ -529,6 +530,11 @@ export function ContextSettingsModal({
                       ))}
                     </select>
                   </FormField>
+                  {openAICompatPresetOption(formState.CLAUDE_MEM_OPENAI_COMPAT_PRESET).note && (
+                    <span className="toggle-description">
+                      {openAICompatPresetOption(formState.CLAUDE_MEM_OPENAI_COMPAT_PRESET).note}
+                    </span>
+                  )}
                   <FormField
                     label="Base URL"
                     tooltip="Leave blank to use the preset's endpoint"
@@ -635,7 +641,7 @@ export function ContextSettingsModal({
                 />
               </div>
             </CollapsibleSection>
-          </div>
+          </fieldset>
         </div>
 
         {/* Footer with Save button */}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react';
 import { Header } from './components/Header';
 import { Feed } from './components/Feed';
 import { ViewTabs, type ViewTab } from './components/ViewTabs';
@@ -58,12 +58,21 @@ export function App() {
   const [paginatedObservations, setPaginatedObservations] = useState<Observation[]>([]);
   const [paginatedSummaries, setPaginatedSummaries] = useState<Summary[]>([]);
   const [paginatedPrompts, setPaginatedPrompts] = useState<UserPrompt[]>([]);
+  const [feedLoadError, setFeedLoadError] = useState<string | null>(null);
   const [route, setRoute] = useState<ViewRoute>(() => parseViewRoute(window.location.hash));
   // The Sessions list keeps the last timeline/session scope, so switching back
   // does not reload pages that are still correct.
   const [feedScope, setFeedScope] = useState<FeedScope>(
     () => scopeForRoute(route, currentFilter) ?? { project: currentFilter, session: null }
   );
+  const scopeKey = feedScopeKey(feedScope);
+  const activeFeedScopeRef = useRef({ key: scopeKey, version: 0 });
+  const feedVisit = activeFeedScopeRef.current.key === scopeKey
+    ? activeFeedScopeRef.current
+    : { key: scopeKey, version: activeFeedScopeRef.current.version + 1 };
+  // Only a committed scope retires the previous visit's rows and errors.
+  useLayoutEffect(() => { activeFeedScopeRef.current = feedVisit; }, [feedVisit]);
+  const feedVersion = feedVisit.version;
 
   const catalog = useSessionCatalog();
   const { observations, summaries, prompts, projects, isProcessing, queueDepth, removeLiveItem, removeLiveSession } = useSSE({
@@ -140,26 +149,32 @@ export function App() {
   }, []);
 
   const handleLoadMore = useCallback(async () => {
+    // A second visit to the same scope has a new owner, even if its key matches.
+    if (activeFeedScopeRef.current.version !== feedVersion) return;
+    const requestFeedVersion = feedVersion;
+    const isCurrentVisit = () => activeFeedScopeRef.current.version === requestFeedVersion;
+    setFeedLoadError(null);
     try {
-      const [newObservations, newSummaries, newPrompts] = await Promise.all([
-        pagination.observations.loadMore(),
-        pagination.summaries.loadMore(),
-        pagination.prompts.loadMore()
+      // Each cursor advances independently; commit its rows before a sibling
+      // request can reject the group, or successful pages would be skipped.
+      await Promise.all([
+        pagination.observations.loadMore().then(rows => {
+          if (isCurrentVisit() && rows.length) setPaginatedObservations(prev => [...prev, ...rows]);
+        }),
+        pagination.summaries.loadMore().then(rows => {
+          if (isCurrentVisit() && rows.length) setPaginatedSummaries(prev => [...prev, ...rows]);
+        }),
+        pagination.prompts.loadMore().then(rows => {
+          if (isCurrentVisit() && rows.length) setPaginatedPrompts(prev => [...prev, ...rows]);
+        })
       ]);
-
-      if (newObservations.length > 0) {
-        setPaginatedObservations(prev => [...prev, ...newObservations]);
-      }
-      if (newSummaries.length > 0) {
-        setPaginatedSummaries(prev => [...prev, ...newSummaries]);
-      }
-      if (newPrompts.length > 0) {
-        setPaginatedPrompts(prev => [...prev, ...newPrompts]);
-      }
     } catch (error) {
       console.error('Failed to load more data:', error);
+      if (isCurrentVisit()) {
+        setFeedLoadError(error instanceof Error ? error.message : 'Failed to load more data');
+      }
     }
-  }, [pagination.observations, pagination.summaries, pagination.prompts]);
+  }, [feedVersion, pagination.observations, pagination.summaries, pagination.prompts]);
 
   // One removal path for a deleted row, whether this tab deleted it or another
   // tab did (item_deleted SSE, which also reaches this tab): drop it from the
@@ -261,6 +276,7 @@ export function App() {
         items={feedItems}
         isLoading={isLoading}
         hasMore={hasMore}
+        loadError={feedLoadError}
         onLoadMore={handleLoadMore}
         onDeleted={removeDeletedItem}
         onBack={() => navigate(sessionsHash())}
@@ -275,6 +291,7 @@ export function App() {
         onDeleted={removeDeletedItem}
         isLoading={isLoading}
         hasMore={hasMore}
+        loadError={feedLoadError}
       />
     );
   }
