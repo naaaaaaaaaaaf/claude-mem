@@ -22,9 +22,11 @@ import { getObservationsByFilePath } from '../../../sqlite/observations/get.js';
 import { getFirstObservationCreatedAt } from '../../../sqlite/observations/recent.js';
 import { getParkedSlotWaiterCount } from '../../../../supervisor/process-registry.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
+import { readObserverHealth } from '../../../../shared/observer-health.js';
 import { assertCanonicalDecimal, type ContentKind } from '../../../sync/CanonicalContent.js';
 import type { CloudSync } from '../../../sync/CloudSync.js';
 import { emitContextInvalidation } from '../../../../shared/context-invalidation.js';
+import { parseProjectList } from '../../../../shared/project-list.js';
 import { projectReadKeysFor } from '../../search/project-where-filter.js';
 
 // Chroma doc_type per content kind. Observation and summary id spaces overlap,
@@ -305,8 +307,8 @@ export class DataRoutes extends BaseRouteHandler {
       return;
     }
 
-    const projectsParam = req.query.projects as string | undefined;
-    const projects = projectsParam ? projectsParam.split(',').filter(Boolean) : undefined;
+    const listedProjects = parseProjectList(req.query.projects);
+    const projects = listedProjects.length > 0 ? listedProjects : undefined;
     const parsedLimit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
     const limit = Number.isFinite(parsedLimit) && parsedLimit! > 0 ? parsedLimit : undefined;
     const platformSource = this.getOptionalPlatformSourceFromRequest(req);
@@ -752,7 +754,16 @@ export class DataRoutes extends BaseRouteHandler {
     // #2756 — additive: sessions currently parked in waitForSlot, never a
     // breaking change to existing isProcessing/queueDepth consumers.
     const parkedSessions = getParkedSlotWaiterCount();
-    res.json({ isProcessing, queueDepth, parkedSessions });
+    // #5374 — additive: the observer health ledger's last successful store,
+    // so a silently stalled pipeline is visible while isProcessing and
+    // /api/health keep reporting green (one installation went 26 h with no
+    // saves behind an "ok" health check).
+    const lastSuccessfulStoreAt = readObserverHealth()?.lastSuccessAt ?? null;
+    // #5405 — additive: sessions the response-stall pacer abandoned, with the
+    // messages they hold, so a stuck-looking queue can be told apart from a
+    // busy one. Reporting only — nothing here resumes or discards them.
+    const abandonedStallSessions = this.sessionManager.getAbandonedStallSessions();
+    res.json({ isProcessing, queueDepth, parkedSessions, lastSuccessfulStoreAt, abandonedStallSessions });
   });
 
   private parsePaginationParams(req: Request): { offset: number; limit: number; project?: string; platformSource?: string; contentSessionId?: string } {
