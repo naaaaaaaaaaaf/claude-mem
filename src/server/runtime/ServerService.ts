@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { parseArgs } from 'util';
 import { Server, type RouteHandler } from '../../services/server/Server.js';
 import { paths } from '../../shared/paths.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 import { logger } from '../../utils/logger.js';
 import {
   captureProcessStartToken,
@@ -251,12 +252,19 @@ export class ServerService {
         }
         this.server = null;
       }
-      await Promise.all([
-        this.graph.queueManager.close(),
-        this.graph.generationWorkerManager.close(),
-        this.graph.stopBackgroundWork?.(),
+      // Each owner must finish releasing its database work before the pool
+      // closes, even if a sibling close fails. Keep the original failure for
+      // the caller, but do not let it skip remaining resource cleanup.
+      const boundaries = await Promise.allSettled([
+        () => this.graph.queueManager.close(),
+        () => this.graph.generationWorkerManager.close(),
+        () => this.graph.stopBackgroundWork?.(),
+      ].map(close => Promise.resolve().then(close)));
+      const pool = await Promise.allSettled([
+        Promise.resolve().then(() => this.graph.postgres.pool.end()),
       ]);
-      await this.graph.postgres.pool.end();
+      const failure = [...boundaries, ...pool].find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
     } finally {
       if (this.persistRuntimeState) {
         removeServerState();
@@ -872,7 +880,8 @@ function spawnServerDaemon(port: number): number | undefined {
   // DATA_DIR without creating it — so create it rather than depend on some earlier
   // caller having done so. Idempotent.
   mkdirSync(paths.dataDir(), { recursive: true });
-  const child = spawn(process.execPath, [scriptPath, '--daemon'], {
+  // The server's embedder loads sharp; never let Bun auto-install it (#5601).
+  const child = spawn(process.execPath, [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,

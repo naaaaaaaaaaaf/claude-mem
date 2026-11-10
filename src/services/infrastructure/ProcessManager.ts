@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'os';
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, statSync, utimesSync, copyFileSync, realpathSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import { spawnHidden } from '../../shared/spawn.js';
+import { withoutNpmSettingsFromAutoUpdateNpxFlags } from '../../shared/auto-update-install-run.js';
 import { logger } from '../../utils/logger.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { removeOwnedPidFile } from '../../supervisor/shutdown.js';
@@ -11,6 +12,7 @@ import { getSupervisor, validateWorkerPidFile, type ValidateWorkerPidStatus } fr
 import { emitRemapProject, hasSyncLane } from '../sync/remap-outbox.js';
 import { buildWorktreeProjectKey } from '../../utils/project-name.js';
 import { paths } from '../../shared/paths.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 
 const DATA_DIR = paths.dataDir();
 const PID_FILE = paths.workerPid();
@@ -467,6 +469,16 @@ export function pinDaemonWorkingDirectory(
 export const WORKER_BOOT_PROBE_TIMEOUT_MS = 5000;
 const WORKER_BOOT_PROBE_MAX_LINES = 8;
 
+// The bind must happen within this window. server.listen() is the first ref'd
+// handle in the boot path, so a stall before it lets the event loop empty and
+// the process exit 0 with no trace. A ref'd watchdog (worker-service.ts start)
+// holds the loop open and exits loudly if the bind never lands. 60s clears the
+// slowest healthy Windows cold boot with margin (the spawner's own readiness
+// wait is 30s). It lives here, not in worker-service.ts, so the auto-updater's
+// startup ceiling (auto-update-deadlines.ts) can count it without importing
+// the worker.
+export const WORKER_BOOT_BIND_DEADLINE_MS = 60_000;
+
 /**
  * Did the probe "time out" too early for that timeout to be real?
  *
@@ -517,7 +529,8 @@ export function probeWorkerBootFailure(
   const runProbe = (): { result: ReturnType<typeof spawnSync>; elapsedMs: number } | undefined => {
     const startedAt = Date.now();
     try {
-      const result = spawnSync(runtimePath, [scriptPath, 'status'], {
+      // Same auto-install setting as the daemon it stands in for (#5601).
+      const result = spawnSync(runtimePath, [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, 'status'], {
         encoding: 'utf-8',
         timeout: timeoutMs,
         windowsHide: true,
@@ -586,6 +599,10 @@ export interface DetachedWorkerDaemonSpawn {
  * the child gets no console window. `setsid` is POSIX-only — dropping it would
  * let the daemon keep the caller's process group and receive its terminal's
  * signals.
+ *
+ * Bun's auto-install is off (BUN_NO_AUTO_INSTALL_FLAG): from a plugin root
+ * without node_modules it resolves sharp to its wasm32 build, whose first
+ * decode freezes the daemon for good (#5601).
  */
 export function buildDetachedWorkerDaemonSpawn(
   runtimePath: string,
@@ -595,9 +612,10 @@ export function buildDetachedWorkerDaemonSpawn(
   setsidAvailable: boolean = existsSync(SETSID_PATH)
 ): DetachedWorkerDaemonSpawn {
   const useSetsid = platform !== 'win32' && setsidAvailable;
+  const runtimeArgs = [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, '--daemon'];
   return {
     command: useSetsid ? SETSID_PATH : runtimePath,
-    args: useSetsid ? [runtimePath, scriptPath, '--daemon'] : [scriptPath, '--daemon'],
+    args: useSetsid ? [runtimePath, ...runtimeArgs] : runtimeArgs,
     options: {
       detached: true,
       stdio: 'ignore',
@@ -669,11 +687,12 @@ export function spawnDaemon(
 ): number | undefined {
   getSupervisor().assertCanSpawn('worker daemon');
 
-  const env = sanitizeEnv({
+  // The worker an auto-update's installer starts does not keep the npm package and yes settings npx set from the auto-updater's flags.
+  const env = withoutNpmSettingsFromAutoUpdateNpxFlags(sanitizeEnv({
     ...process.env,
     CLAUDE_MEM_WORKER_PORT: String(port),
     ...extraEnv
-  });
+  }));
 
   const runtimePath = resolveWorkerRuntimePath();
   if (!runtimePath) {

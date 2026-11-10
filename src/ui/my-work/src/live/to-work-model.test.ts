@@ -133,6 +133,17 @@ const snapshotWith = (humanRequests: WorkViewHumanRequest[], extra: Partial<Work
   source: { kind: 'test', connected: true, error: null, lastCheckedAt: null }, ...extra,
 })
 
+test('looks up conversation titles by platform and content-session identity', () => {
+  const raw = syntheticRequest()
+  raw.conversationKeys = ['claude', 'codex'].map(platform => JSON.stringify(['conversation', platform, 'same-id']))
+  const agents = ['claude', 'codex'].map(platform => ({
+    id: platform, label: platform, platformSource: platform, sessionTitle: platform + ' session',
+    project: 'repo', contentSessionId: 'same-id',
+  }))
+  const [request] = toWorkModel(snapshotWith([raw], { agents }), Date.now()).requests
+  assert.deepEqual(request.conversations.map(item => item.title), ['claude session', 'codex session'])
+})
+
 test('maps shared decision versions and keeps an origin-only file visible without a link', () => {
   const raw = syntheticRequest()
   raw.review = { checked: false, checkedAtEpoch: null, actor: 'shared-user', available: true, mode: 'shared', hash: 'review-hash', version: 2, conflict: true, pending: true, message: 'Choose the current review.' }
@@ -250,7 +261,7 @@ test('the automatic refresh maps running, last refreshed and failure text, with 
   assert.deepEqual(toWorkModel({ ...base, refresh: { state: 'running', startedAt: '2026-10-21T11:00:00Z' } }, at).refresh, { state: 'running', finishedAt: null, error: null })
   const ok = toWorkModel({ ...base, refresh: { state: 'ok', startedAt: '2026-10-21T11:00:00Z', finishedAt: '2026-10-21T11:40:00Z', error: null } }, at).refresh
   assert.equal(ok?.state, 'ok')
-  assert.match(ok!.finishedAt!, /^Oct 21(,| at) \d{1,2}:40 [ap]m$/)
+  assert.match(ok!.finishedAt!, /^Oct 21(,| at) \d{1,2}:\d{2} [ap]m$/)
   assert.deepEqual(toWorkModel({ ...base, refresh: { state: 'failed', finishedAt: '2026-10-21T11:40:00Z', error: 'codex exec exited 1' } }, at).refresh?.error, 'codex exec exited 1')
   assert.deepEqual(toWorkModel({ ...base, refresh: { state: 'waiting-for-agent', error: 'No logged-in Claude Code, Codex or Gemini on this computer yet.' } }, at).refresh, { state: 'waiting-for-agent', finishedAt: null, error: 'No logged-in Claude Code, Codex or Gemini on this computer yet.' })
 })

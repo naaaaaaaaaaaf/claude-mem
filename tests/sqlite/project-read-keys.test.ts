@@ -97,12 +97,12 @@ describe('projectReadKeys adopted-row scoping (#4782)', () => {
     }
   });
 
-  it('keeps discovering the stored spellings of the requested projects', () => {
+  it('expands a large project catalog without duplicating its SQLite bind slots', () => {
     const store = new SessionStore(':memory:');
     try {
-      seedProject(store, 'cased', 'Nuviapel', ['CASED_ROW']);
-
-      expect(projectReadKeys(store.db, ['nuviapel'])).toEqual(['nuviapel', 'Nuviapel']);
+      seedProject(store, 'cased', 'CaseSensitive', ['CATALOG_ROW']);
+      const requested = [...Array.from({ length: 4_000 }, (_, i) => 'p' + i), 'casesensitive'];
+      expect(projectReadKeys(store.db, requested)).toEqual([...requested, 'CaseSensitive']);
     } finally {
       store.close();
     }

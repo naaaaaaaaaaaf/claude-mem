@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'bun:test';
-import { IdleExitMonitor, MIN_IDLE_EXIT_MS, parseIdleExitMs } from '../../src/services/worker/idle-exit-monitor.js';
+import { afterAll, describe, it, expect } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import path from 'path';
+import { IdleExitMonitor, idleExitWindowMs, MIN_IDLE_EXIT_MS, parseIdleExitMs } from '../../src/services/worker/idle-exit-monitor.js';
+import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
 
 // IdleExitMonitor lives in src/services/worker/idle-exit-monitor.ts (not
 // worker-service.ts) for the same reason as runShutdownSequence in
@@ -121,22 +124,32 @@ describe('IdleExitMonitor — idle decision', () => {
     expect(h.idleCalls.length).toBe(1);
   });
 
-  it('refreshes the activity clock while sessions saw recent activity', () => {
+  it.each([
+    { name: 'recent session activity', elapsed: IDLE_EXIT_MS - 1_000,
+      set: (h: Harness) => { h.state.lastSessionActivityAt = h.now(); },
+      clear: (h: Harness) => { h.state.lastSessionActivityAt = h.now() - (IDLE_EXIT_MS - 1_000); } },
+    { name: 'recent host requests', elapsed: IDLE_EXIT_MS - 1_000,
+      set: (h: Harness) => { h.state.lastRequestAt = h.now(); }, clear: (_h: Harness) => {} },
+    { name: 'a request between ticks', elapsed: 300_000,
+      set: (h: Harness) => { h.state.lastRequestAt = h.now(); }, clear: (_h: Harness) => {} },
+    { name: 'queued compression work', elapsed: IDLE_EXIT_MS - 1_000,
+      set: (h: Harness) => { h.state.queueDepth = 3; }, clear: (h: Harness) => { h.state.queueDepth = 0; } },
+    { name: 'a finished AI interaction between ticks', elapsed: 300_000,
+      set: (h: Harness) => { h.state.lastAiAt = h.now(); }, clear: (_h: Harness) => {} },
+  ])('restarts the idle window after $name', ({ elapsed, set, clear }) => {
     const h = makeHarness();
-
     h.monitor.start();
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.state.lastSessionActivityAt = h.now();
-    h.monitor.tick(); // refresh: lastActivityAt = now
+    h.advance(elapsed);
+    set(h);
+    h.monitor.tick();
 
-    // Session activity now older than the window.
-    h.state.lastSessionActivityAt = h.now() - (IDLE_EXIT_MS - 1_000);
+    clear(h);
     h.advance(IDLE_EXIT_MS - 1_000);
-    h.monitor.tick(); // idle since refresh < window
+    h.monitor.tick();
     expect(h.idleCalls.length).toBe(0);
 
     h.advance(1_000);
-    h.monitor.tick(); // exactly the window since the refresh
+    h.monitor.tick();
     expect(h.idleCalls.length).toBe(1);
   });
 
@@ -151,62 +164,6 @@ describe('IdleExitMonitor — idle decision', () => {
     h.advance(IDLE_EXIT_MS);
     h.monitor.tick();
 
-    expect(h.idleCalls.length).toBe(1);
-  });
-
-  it('refreshes the activity clock while a host keeps sending requests', () => {
-    const h = makeHarness();
-
-    h.monitor.start();
-    // A plugin poller hitting the worker keeps it alive: the request
-    // timestamp observed at this tick resets the window.
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.state.lastRequestAt = h.now();
-    h.monitor.tick();
-
-    // No new request since — the window runs from the one above.
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(0);
-
-    h.advance(1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(1);
-  });
-
-  it('starts the window at a request that landed after the previous tick', () => {
-    const h = makeHarness();
-
-    h.monitor.start(); // lastActivityAt = T0
-    h.advance(300_000);
-    // A request lands between ticks (the worker's own boot probes do this).
-    h.state.lastRequestAt = h.now();
-    h.monitor.tick();
-
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(0);
-
-    h.advance(1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(1);
-  });
-
-  it('refreshes the activity clock while queue depth is nonzero (queued compression work)', () => {
-    const h = makeHarness();
-
-    h.monitor.start();
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.state.queueDepth = 3;
-    h.monitor.tick();
-
-    h.state.queueDepth = 0;
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(0);
-
-    h.advance(1_000);
-    h.monitor.tick();
     expect(h.idleCalls.length).toBe(1);
   });
 
@@ -242,25 +199,6 @@ describe('IdleExitMonitor — idle decision', () => {
 
     h.state.viewerClients = 0;
     h.advance(IDLE_EXIT_MS);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(1);
-  });
-
-  it('treats a finished AI interaction newer than the last observed tick as activity', () => {
-    const h = makeHarness();
-
-    h.monitor.start(); // lastActivityAt = T0
-    h.advance(300_000);
-    // A compression finished AFTER the last activity tick (e.g. it outlived
-    // the session): its timestamp becomes the activity baseline.
-    h.state.lastAiAt = h.now();
-    h.monitor.tick();
-
-    h.advance(IDLE_EXIT_MS - 1_000);
-    h.monitor.tick();
-    expect(h.idleCalls.length).toBe(0);
-
-    h.advance(1_000);
     h.monitor.tick();
     expect(h.idleCalls.length).toBe(1);
   });
@@ -309,5 +247,74 @@ describe('parseIdleExitMs — CLAUDE_MEM_IDLE_EXIT_SEC parsing', () => {
   it('returns windows under the 60 s minimum as given; the worker wiring raises them', () => {
     expect(parseIdleExitMs('5')).toBe(5_000);
     expect(MIN_IDLE_EXIT_MS).toBe(60_000);
+  });
+});
+
+describe('idleExitWindowMs — the window the worker arms with', () => {
+  it('is 0 where the worker never idle-exits: absent, empty, 0, and a value it ignores', () => {
+    for (const raw of [undefined, '', '  ', '0', 'abc', '-1', '1e308']) expect(idleExitWindowMs(raw)).toBe(0);
+  });
+
+  it('raises a window under the minimum to it, and keeps one at or over it', () => {
+    expect(idleExitWindowMs('1')).toBe(MIN_IDLE_EXIT_MS);
+    expect(idleExitWindowMs('59')).toBe(MIN_IDLE_EXIT_MS);
+    expect(idleExitWindowMs('60')).toBe(60_000);
+    expect(idleExitWindowMs('600')).toBe(600_000);
+  });
+});
+
+describe('CLAUDE_MEM_IDLE_EXIT_SEC saved as a JSON number, as the worker reads it', () => {
+  // Project-local scratch (gitignored), never the system temp folder, as in
+  // tests/worker/http/routes/setup-state-routes.test.ts.
+  const scratchRoot = path.join(import.meta.dir, '..', '..', '.scratch', 'test-runs');
+  mkdirSync(scratchRoot, { recursive: true });
+  const tempDir = mkdtempSync(path.join(scratchRoot, 'idle-exit-number-'));
+  afterAll(() => rmSync(tempDir, { recursive: true, force: true }));
+
+  /** CLAUDE_MEM_IDLE_EXIT_SEC from a settings.json holding `saved`, loaded the way the worker loads its settings (worker-service.ts initializeBackground). */
+  const loadedFromSettingsJson = (name: string, saved: unknown): unknown => {
+    const settingsPath = path.join(tempDir, name, 'settings.json');
+    mkdirSync(path.dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ CLAUDE_MEM_IDLE_EXIT_SEC: saved }));
+    const fromEnv = process.env.CLAUDE_MEM_IDLE_EXIT_SEC;
+    delete process.env.CLAUDE_MEM_IDLE_EXIT_SEC;
+    try {
+      return SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_IDLE_EXIT_SEC;
+    } finally {
+      if (fromEnv !== undefined) process.env.CLAUDE_MEM_IDLE_EXIT_SEC = fromEnv;
+    }
+  };
+
+  it('reaches the worker as a number, and reads as the window its text would give', () => {
+    const loaded = loadedFromSettingsJson('sixty', 60);
+    // The settings manager turns only a JSON boolean into text, so the number arrives as it was saved.
+    expect(typeof loaded).toBe('number');
+    expect(parseIdleExitMs(loaded)).toBe(parseIdleExitMs('60'));
+    expect(parseIdleExitMs(loaded)).toBe(60_000);
+    expect(idleExitWindowMs(loaded)).toBe(60_000);
+  });
+
+  it('reads every number the way its text reads: 0 is off, a short window is raised to the minimum, and a fraction, a negative or an overflow is a value the worker ignores', () => {
+    // [the number saved, what parseIdleExitMs reads, the window the worker arms with]
+    const rows: Array<[number, number | null, number]> = [
+      [0, 0, 0],
+      [30, 30_000, MIN_IDLE_EXIT_MS],
+      [600, 600_000, 600_000],
+      [1.5, null, 0],
+      [-1, null, 0],
+      [1e308, null, 0],
+    ];
+    rows.forEach(([saved, parsed, window], index) => {
+      const loaded = loadedFromSettingsJson(`number-${index}`, saved);
+      expect({ saved, parsed: parseIdleExitMs(loaded), window: idleExitWindowMs(loaded) }).toEqual({ saved, parsed, window });
+      expect(parseIdleExitMs(loaded)).toBe(parseIdleExitMs(String(saved)));
+    });
+  });
+
+  it('reads JSON that is neither text nor a number as a value the worker ignores, never throwing', () => {
+    [null, [60], { seconds: 60 }].forEach((saved, index) => {
+      const loaded = loadedFromSettingsJson(`not-text-${index}`, saved);
+      expect({ saved, parsed: parseIdleExitMs(loaded), window: idleExitWindowMs(loaded) }).toEqual({ saved, parsed: null, window: 0 });
+    });
   });
 });

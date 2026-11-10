@@ -63,6 +63,7 @@ function runLauncher(
   // from the session running the tests can never leak into resolution.
   const launcherEnvironment: Record<string, string> = {
     PATH: process.env.PATH ?? '',
+    BUN_PATH: process.execPath,
     // where.exe needs PATHEXT to match bun.exe, and the launcher runs it from SystemRoot.
     ...(process.platform === 'win32'
       ? { PATHEXT: process.env.PATHEXT ?? '', SystemRoot: process.env.SystemRoot ?? '' }
@@ -205,32 +206,34 @@ describe('claude-mem launcher', () => {
     expect(result.stderr).toContain('usage: claude-mem hook <platform> <event>');
   });
 
-  it('passes non-hook subcommands through to worker-service.cjs with stdin closed', () => {
-    const temporaryHome = makeTemporaryHome();
-    const environmentRoot = makeStubPluginRoot(path.join(temporaryHome, 'env-root'));
+  // A hook must not parse the whole worker bundle: it runs the hook-only
+  // hook-service.cjs when the plugin ships it, and worker-service.cjs otherwise.
+  describe('hook routing', () => {
+    const hookServiceStub = `process.stdout.write(JSON.stringify({ script: 'hook-service', argv: process.argv.slice(2) }));`;
 
-    const result = runLauncher(['start'], {
-      temporaryHome,
-      stdinPayload: '{"ignored":true}',
-      extraEnvironment: { CLAUDE_PLUGIN_ROOT: environmentRoot },
+    it('runs hook-service.cjs for hook commands when it exists', () => {
+      const temporaryHome = makeTemporaryHome();
+      const pluginRoot = makeStubPluginRoot(path.join(temporaryHome, 'env-root'));
+      writeFileSync(path.join(pluginRoot, 'scripts', 'hook-service.cjs'), hookServiceStub);
+
+      const result = runObservationHook({ temporaryHome, extraEnvironment: { CLAUDE_PLUGIN_ROOT: pluginRoot } });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({ script: 'hook-service', argv: ['hook', 'claude-code', 'observation'] });
     });
 
-    expect(result.status).toBe(0);
-    const stubWorkerOutput = parseStubWorkerOutput(result.stdout);
-    expect(stubWorkerOutput.argv).toEqual(['start']);
-    expect(stubWorkerOutput.stdin).toBe('');
-    expect(existsSync(path.join(temporaryHome, '.claude-mem', 'CAPTURE_BROKEN'))).toBe(false);
-  });
+    it('keeps non-hook commands on worker-service.cjs even when hook-service.cjs exists', () => {
+      const temporaryHome = makeTemporaryHome();
+      const pluginRoot = makeStubPluginRoot(path.join(temporaryHome, 'env-root'));
+      writeFileSync(path.join(pluginRoot, 'scripts', 'hook-service.cjs'), hookServiceStub);
 
-  it('accepts a root that has worker-service.cjs but no bun-runner.js', () => {
-    const temporaryHome = makeTemporaryHome();
-    const workerOnlyRoot = makeStubPluginRoot(path.join(temporaryHome, 'worker-only-root'));
-    expect(existsSync(path.join(workerOnlyRoot, 'scripts', 'bun-runner.js'))).toBe(false);
+      const result = runLauncher(['start'], { temporaryHome, extraEnvironment: { CLAUDE_PLUGIN_ROOT: pluginRoot } });
 
-    const result = runObservationHook({ temporaryHome, extraEnvironment: { CLAUDE_PLUGIN_ROOT: workerOnlyRoot } });
-
-    expect(result.status).toBe(0);
-    expect(parseStubWorkerOutput(result.stdout).pluginRoot).toBe(workerOnlyRoot);
+      expect(result.status).toBe(0);
+      const stubWorkerOutput = parseStubWorkerOutput(result.stdout);
+      expect(stubWorkerOutput.argv).toEqual(['start']);
+      expect(stubWorkerOutput.stdin).toBe('');
+    });
   });
 
   it('resolves the plugin root from CLAUDE_PLUGIN_ROOT and passes hook argv through', () => {

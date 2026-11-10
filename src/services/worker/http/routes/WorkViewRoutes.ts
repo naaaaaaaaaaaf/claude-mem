@@ -47,6 +47,7 @@ import type { SetupScan, SetupScanState } from '../../../prompt-import/setup-sca
 import { readHistoryCounts, type HistoryImport } from '../../../setup/history-import.js';
 import { createSetupTelemetry } from '../../../setup/telemetry.js';
 import { hasActiveSetupSession, hasProConfiguration, readSetupState, setupStatePath, writeSetupState, type SetupStateFile, type SetupStateView } from '../../../../shared/setup-state.js';
+import { SETUP_BRANCHES, SETUP_INSTALLER_STAGES, SETUP_MEMORY_BILLINGS } from '../../../../shared/setup-funnel.js';
 
 // A request is ready for a human check once its explicit lifecycle reports it complete, shipped, or waiting for review.
 // Statuses are compared lowercased with `_` and spaces read as `-`, matching the viewer's status normalization.
@@ -300,13 +301,13 @@ const setupScanConsentBody = z.object({ upload: z.boolean(), agents: z.array(z.e
 const setupScanPreferencesBody = z.object({ improveProduct: z.boolean() }).strict();
 // On The Go is always CMEM Pro: standalone Cloud Sync on your own tokens has no price yet (gap G1).
 const setupChoiceBody = z.object({
-  branch: z.enum(['home', 'go']),
-  memoryBilling: z.enum(['hosted', 'existing']),
+  branch: z.enum(SETUP_BRANCHES),
+  memoryBilling: z.enum(SETUP_MEMORY_BILLINGS),
 }).strict().refine(choice => choice.branch === 'home' || choice.memoryBilling === 'hosted', {
   message: 'On The Go uses CMEM Pro (memoryBilling "hosted").',
 });
 const setupInstallerBody = z.object({
-  stage: z.enum(['waiting-for-choice', 'home-ready', 'go-kept-existing-pro', 'go-awaiting-checkout', 'failed']),
+  stage: z.enum(SETUP_INSTALLER_STAGES),
   error: z.string().max(2000).nullable().optional(),
   /** The installer mirrors the pairing checkout it is running (funnel Phase 8). */
   checkout: z.enum(['waiting', 'paid', 'failed']).optional(),
@@ -825,15 +826,43 @@ export class WorkViewRoutes extends BaseRouteHandler {
   private setupStateView(state: SetupStateFile = readSetupState(this.setupStatePath)): SetupStateView {
     const settings = SettingsDefaultsManager.loadFromFile(this.settingsPath, true, { readOnly: true }) as unknown as Record<string, unknown>;
     const historyImport = this.historyImport?.state() ?? null;
+    return { ...state, alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning: this.backgroundWorkRunning({ countScanWaitingForUploadAnswer: true }) };
+  }
+
+  /**
+   * Long work this worker is doing now that a restart would kill (SetupStateView.backgroundWorkRunning): the
+   * extraction run and the history import. GET /api/setup/state reports it, and the installer waits for it before
+   * any restart (browser-setup.ts waitForBackgroundWorkToFinish); the auto-updater counts it as busy
+   * (worker-service.ts runningBackgroundJobNames). Reads refresh.json; throws when that file cannot be read.
+   *
+   * countScanWaitingForUploadAnswer: whether a setup scan held at the "upload your prompts?" question
+   * ('awaiting-consent') counts as the extraction run. The installer's view counts it, as it always has. The
+   * auto-updater does not: the held scan runs nothing and waits in memory with no time limit (a closed tab never
+   * answers), and a restart drops it anyway, so counting it would read busy until the worker restarts.
+   * setupIsActive leaves that phase out for the same reason.
+   */
+  backgroundWorkRunning({ countScanWaitingForUploadAnswer }: { countScanWaitingForUploadAnswer: boolean }): NonNullable<SetupStateView['backgroundWorkRunning']> {
     const backgroundWorkRunning: NonNullable<SetupStateView['backgroundWorkRunning']> = [];
     const refresh = this.autoRefresh?.status() ?? null;
     // A 'running' record whose process is gone was cut off; only a live run counts.
     // The setup scan counts too: when it finishes it starts the extraction run.
     const scanPhase = this.setupScan?.state().phase ?? 'idle';
-    const scanning = !['idle', 'done', 'failed'].includes(scanPhase);
+    const scanning = !['idle', 'done', 'failed'].includes(scanPhase)
+      && (countScanWaitingForUploadAnswer || scanPhase !== 'awaiting-consent');
     if (scanning || (refresh?.state === 'running' && processIsAlive(Number((refresh as { pid?: number }).pid)))) backgroundWorkRunning.push('extraction');
-    if (historyImport?.state === 'running') backgroundWorkRunning.push('history-import');
-    return { ...state, alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning };
+    if (this.historyImport?.state().state === 'running') backgroundWorkRunning.push('history-import');
+    return backgroundWorkRunning;
+  }
+
+  /**
+   * My Work's card-wording requests running now (HumanCopyWorker): chat
+   * completions of up to 90 s each (human-copy-worker.mjs sends with
+   * AbortSignal.timeout(90000)), whose spend is lost when the worker stops
+   * first. The auto-updater counts them as busy (worker-service.ts
+   * runningBackgroundJobNames). In memory; no I/O.
+   */
+  cardWordingRequestsRunning(): number {
+    return this.humanCopy?.status().generating ?? 0;
   }
 
   /** This machine's own observations, for the import offer. A missing database is a new install: nothing to import. */

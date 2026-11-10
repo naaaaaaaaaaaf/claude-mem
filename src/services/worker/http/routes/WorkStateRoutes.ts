@@ -10,11 +10,12 @@ import { getProjectContext } from '../../../../utils/project-name.js';
 import { logger } from '../../../../utils/logger.js';
 import type { WorkStateFields } from '../../../sqlite/work-state.js';
 import { isMyRulesList } from '../../../work-view/my-rules.mjs';
-import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
+import { isForeignBrowserRead, isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
 import { isMyFocusList } from '../../../work-view/my-focus.mjs';
 import { GOAL_KINDS, isOwnerGoalsList } from '../../../work-view/owner-goals.mjs';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
 import { isSharedWorkList } from '../../../work-view/shared-records.mjs';
+import { isClosedWorkStateStatus } from '../../../work-view/work-state-status.mjs';
 import {
   fitWorkStateLines,
   renderWorkStateLines,
@@ -47,11 +48,10 @@ const workStateWriteSchema = z.object({
     ),
 });
 
-const CLOSING_STATUSES = ['dropped', 'done'];
 /** Why an owner-goals row cannot be saved, or null. List state rows and a row that only closes an item need no kind. */
 export function ownerGoalsRowRefusal(fields: WorkStateFields): string | null {
   if (fields.task == null || fields.task === '') return null;
-  const onlyCloses = Object.keys(fields).every(key => key === 'task' || key === 'status') && CLOSING_STATUSES.includes(String(fields.status));
+  const onlyCloses = Object.keys(fields).every(key => key === 'task' || key === 'status') && isClosedWorkStateStatus(fields.status);
   if (onlyCloses && !('goal_kind' in fields)) return null;
   if (!(GOAL_KINDS as unknown[]).includes(fields.goal_kind)) {
     return `an owner-goals item needs goal_kind ${GOAL_KINDS.map(kind => `"${kind}"`).join(' or ')}; got ${JSON.stringify(fields.goal_kind ?? null)}.`;
@@ -129,6 +129,14 @@ export class WorkStateRoutes extends BaseRouteHandler {
   });
 
   private handleRead = this.wrapHandler((req: Request, res: Response): void => {
+    // The read still resolves the project from `cwd`, and that resolution runs
+    // `git` in it (findGitRepoRoot), so another browser page must not choose
+    // the directory, even with a no-cors fetch that sends no Origin. Hooks, the
+    // CLI and the MCP tool send no browser headers and keep working.
+    if (isForeignBrowserRead(req)) {
+      res.status(403).json({ error: 'Forbidden', message: 'Work-state reads from another browser page are not allowed' });
+      return;
+    }
     const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
     if (!cwd) {
       this.badRequest(res, 'cwd is required');
