@@ -881,6 +881,19 @@ describe('ensureDirectoryOnWindowsUserPath', () => {
     expect(runPowerShell.calls).toHaveLength(1);
   });
 
+  // #5830: a hidden -EncodedCommand PowerShell spawn matches antivirus
+  // heuristics (Kaspersky), so it must not run when nothing needs editing.
+  it('spawns no PowerShell when the directory is already on this process PATH', () => {
+    for (const existingSpelling of [launcherDirectory, launcherDirectory.toUpperCase(), `"${launcherDirectory}\\"`]) {
+      const runPowerShell = fakePowerShell({ stdout: 'added' });
+      const processPath = `C:\\Windows;${existingSpelling}`;
+      const host: LauncherHostEnvironment = { ...windowsHost(), environmentVariables: { PATH: processPath } };
+      expect(ensureDirectoryOnWindowsUserPath({ directory: launcherDirectory, logger: recordingLogger(), host, runPowerShell })).toBe('already-on-user-path');
+      expect(runPowerShell.calls).toHaveLength(0);
+      expect(host.environmentVariables.PATH).toBe(processPath);
+    }
+  });
+
   it('includes the spawn error (timeout, ENOENT) instead of "exit null"', () => {
     const logger = recordingLogger();
     const runPowerShell = fakePowerShell({ status: null, spawnErrorMessage: 'spawnSync powershell.exe ETIMEDOUT' });
@@ -1018,7 +1031,7 @@ describe.skipIf(!isPosixHost)('doctor hook launcher row', () => {
     const scratchHome = makeScratchHome();
     const binDirectory = path.join(scratchHome, '.local', 'bin');
     writeFakeLauncher(path.join(binDirectory, 'claude-mem'), String(LAUNCHER_PROTOCOL));
-    const row = hookLauncherCheck(posixHost(scratchHome, { PATH: `${binDirectory}:/usr/bin` }));
+    const row = hookLauncherCheck(posixHost(scratchHome, { PATH: `${binDirectory}:/usr/bin` }), undefined, codesignNoop);
     expect(row).toMatchObject({ status: 'ok', required: true });
     expect(row.detail).toMatch(new RegExp(`^${path.join(binDirectory, 'claude-mem')} \\(protocol ${LAUNCHER_PROTOCOL}, --version \\d+ ms\\)$`));
   });
@@ -1039,7 +1052,7 @@ describe.skipIf(!isPosixHost)('doctor hook launcher row', () => {
     symlinkSync(cliScript, path.join(cliBin, 'claude-mem'));
     writeFakeLauncher(path.join(launcherDirectory, 'claude-mem'), String(LAUNCHER_PROTOCOL));
 
-    const row = hookLauncherCheck(posixHost(scratchHome, { PATH: `${cliBin}:${launcherDirectory}` }), cliScript);
+    const row = hookLauncherCheck(posixHost(scratchHome, { PATH: `${cliBin}:${launcherDirectory}` }), cliScript, codesignNoop);
 
     expect(row).toMatchObject({ status: temporary ? 'ok' : 'fail', required: true });
     expect(row.detail).toContain(path.join(temporary ? launcherDirectory : cliBin, 'claude-mem'));

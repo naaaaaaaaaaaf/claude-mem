@@ -4,6 +4,119 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [15.17.0] - 2026-11-11
+
+## New: claude-mem memory for eve agents
+
+- **`claude-mem/eve`** is a new export of the `claude-mem` npm package. It is a memory provider for [eve](https://eve.dev), Vercel's framework for durable backend agents. An eve agent can now recall what you did in Claude Code, Codex and your other claude-mem clients, using your [cmem.ai](https://cmem.ai) memory (key from cmem.ai/pro/key) (#5863).
+  - **Recall:** one search before every turn. No inference spend. Matches reach the model as escaped data, never as instructions.
+  - **Tools:** `<slot>__search` to look further back and `<slot>__remember` to save a note. Both are bound to the slot's scope.
+  - **Separate memory per caller:** each eve scope gets its own claude-mem project by default. `searchAllProjects` reads the whole account and is for single-owner agents only.
+  - **No automatic capture:** eve can replay a capture step, and that would save the same turn twice, so saves only happen when the model calls `remember`.
+  - **Failures stay visible:** if cmem.ai can't be reached, the turn still runs, the failure is logged, and the model is told memory is unavailable.
+  - Requires eve 0.84.0 or later and Node.js 24 or later. `eve` and `zod` are optional peer dependencies, so nothing changes for existing installs.
+- **One-click eve personal agent template** at [`integrations/eve/template`](https://github.com/thedotmack/claude-mem/tree/main/integrations/eve/template): password-protected web chat with your claude-mem memory. Deploy with Vercel and enter two values, `EVE_CHAT_PASSWORD` and `CLAUDE_MEM_API_KEY`. iMessage is an eve add-on (`npx eve add channel/linq` or `channel/photon`); only texts from `CLAUDE_MEM_OWNER_PHONE` get your memory.
+
+Quick start for an existing eve agent:
+
+```bash
+npm install claude-mem
+```
+
+```ts
+// agent/memory/claude-mem.ts
+import { claudeMem } from "claude-mem/eve";
+import { defineMemory } from "eve/memory";
+import { byPrincipal } from "eve/memory/scope";
+
+export default defineMemory({
+  description: "Recall and save durable context for the current user.",
+  provider: claudeMem({ apiKey: process.env.CLAUDE_MEM_API_KEY }),
+  scope: byPrincipal,
+});
+```
+
+Docs: https://docs.claude-mem.ai/eve-integration
+
+No changes to the Claude Code plugin's capture, worker or hooks in this release.
+
+**Full changelog:** https://github.com/thedotmack/claude-mem/compare/v15.16.1...v15.17.0
+
+## [15.16.1] - 2026-11-11
+
+## Critical fix
+
+- **Manual saves work again in projects with older manual sessions.** In v15.16.0, `save_memory` (and `POST /api/memory/save`) returned HTTP 500 with `UNIQUE constraint failed: sdk_sessions.memory_session_id` in any project whose manual session was created before 15.16.0 with an older session ID shape. Every save in that project failed. claude-mem now finds and reuses that older session instead of trying to create a duplicate. Deleted sessions still get a fresh ID, as in 15.16.0 (#5842).
+
+If you are on 15.16.0, update to 15.16.1.
+
+## New (both off by default)
+
+- **Opt out of bundled skills:** list skill names in `CLAUDE_MEM_SKILLS_DISABLED` in `~/.claude-mem/settings.json`, as a comma-separated string or a JSON array (for example `"make-plan,do,smart-explore"`). The list is re-applied after installs, repairs and marketplace updates; new skills stay enabled unless you name them (#5837, thanks @liuyinchu, closes #5132).
+- **Line anchors in file context:** set `CLAUDE_MEM_LINE_ANCHORS_ENABLED` to `"true"` and past observations about a file point at the line where that code is now (`@L123`), or say `(code changed since)` when it moved away. Nothing is guessed. With the setting off, nothing is recorded and the hook output is unchanged (#5841, thanks @devkancheti4-design, closes #4943).
+
+## Fixes
+
+- **OpenClaw:** the installer works on OpenClaw 2026.11.2 again, and current OpenClaw records prompts, injects context and summarizes sessions without the removed `before_agent_start` hook. Older OpenClaw versions behave as before (#5840, fixes #5838, reported by @JesseFranzen).
+- **Warp uninstall:** `npx claude-mem uninstall` now removes the `claude-mem` MCP server that `install --ide warp` adds to `~/.warp/.mcp.json`, instead of leaving it pointed at the deleted plugin (#5839, thanks @tanishqbaweja).
+- **Telemetry IDs:** recording a consent decision (installer prompt, `telemetry enable`, `telemetry disable`) keeps the saved anonymous ID, so one install no longer shows up as two. The `telemetry enable` disclosure now lists the events actually sent (#5836, thanks @wiesenthal).
+
+**Full changelog:** https://github.com/thedotmack/claude-mem/compare/v15.16.0...v15.16.1
+
+## [15.16.0] - 2026-11-11
+
+## New
+
+- **My Work refresh on your API provider (opt-in):** set `CLAUDE_MEM_WORK_VIEW_AGENT=api` to run the My Work refresh on the provider you already selected (`openrouter`, `openai-compatible`, or the legacy `cmem` spelling). Installs with no logged-in Claude Code, Codex or Gemini CLI (for example OpenCode or DSH hosts) can now use My Work. With an API provider selected and the setting empty, the refresh no longer falls back to a logged-in Claude Code: no agent runs and nothing is spent until you choose one (#5674, thanks @bulanovk).
+- **GitHub MCP pull requests in My Work:** pull requests created through GitHub's official MCP `create_pull_request` tool now show up as My Work products. Only completed results whose URL matches the requested repository are accepted (#5809, thanks @Afloat16).
+- **UberLLM preset:** `uberllm` is now a preset of the `openai-compatible` provider (`https://api.uberllm.dev/v1`, default model `deepseek/deepseek-v4.1-flash`) (#5706, thanks @PSA-Team-source).
+- **Tunable live handoff timeout:** `CLAUDE_MEM_HOOK_HANDOFF_TIMEOUT_MS` (default 250) sets the budget for the single live handoff from a hook to the worker, and a missed handoff is now logged at WARN instead of DEBUG (#5831, thanks @mohitdixit02).
+
+## Notable fixes
+
+- **Plugin cache cleanup:** the worker now prunes old version folders that Claude Code's marketplace updates leave in `~/.claude/plugins/cache/thedotmack/claude-mem/` (one report: 21 versions, about 16 GB). It keeps the running copy and the registered version, and sweeps after boot settles and then hourly (#5685, thanks @MaxWang007).
+- **Windows antivirus noise:** install, update and launcher rebuilds no longer start a hidden PowerShell when the launcher folder is already on PATH, the pattern Kaspersky flagged (#5835, reported by @Ali-Sabri-0).
+- **My Work language:** when `CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE` is empty, every refresh step now writes in the system locale's language, so one run no longer mixes languages (#5669, thanks @0xABCD01).
+- **My Work idle cost:** idle polling no longer rescans every synced row, and the live overview, focus-area merging and heavy panels do less work per update (#5834).
+- **Backups:** a declined backup run returns a failure, saved backups are reported separately from retention errors, backup intervals beyond the timer limit are honored, and restore rejects stamped snapshots missing worker tables (#5750, #5781, #5784, #5684, thanks @Kirat0201).
+- **Shell setup:** the launcher PATH block and the legacy uninstall alias are written atomically, Cowork stages spooled events under `$HOME` when the host sets it, and Hermes keeps permanent HTTP client errors out of its circuit breaker (#5680, #5679, #5677, #5678, thanks @DeryFerd).
+- **OpenCode:** the bash tool is reported as `Bash`, so `SKIP_BASH_PATTERNS` applies (#5668, thanks @ryrenz).
+- **Sync:** a failed Chroma cleanup after a delete is retried (#5673, thanks @Zhong-fan).
+- **SessionStart:** the cache read and compose steps share one body budget, so a cached body is served only when it fits (#5686, thanks @Varshith-Kali).
+
+## More fixes
+
+About 130 smaller fixes from @Afloat16 across capture, sync, search, context, import, transcripts, media, the server, and the Codex, OpenCode, OpenClaw, Hermes, Grok, Kimi, Gemini, Pi, Goose, Notion and Telegram integrations. Highlights:
+
+- **Search and context:** literal project keys and file paths are preserved through recall, merges and caching; Unicode and combining marks survive query words and snippet limits; cached context expires after restores and row replacements; the largest fitting timeline prefix is kept.
+- **Sync and memory:** session titles commit with their outbox mutation and get receiver redaction; manual saves and new prompts work after a session deletion; note revisions survive title dedup.
+- **Transcripts and import:** multipart Codex messages, paired patch results and zstd frame seams are read correctly; reasoning stays out of final answers; OpenCode, Gemini and restored summaries import without duplicates or lost prompts.
+- **Server and providers:** API key derivation stays off the request loop; cancellations propagate through retries and compression; split token usage is metered on compatible replies; memory content is sanitized before storage.
+- **Media:** image ordinals, Read evidence across path spellings, and advertised image dimension bounds are preserved; inline allowance is charged only for accepted images.
+
+Also from @Kirat0201: file history follows whole project merges, interactive timeline search honors project lists, and unified search keeps literal `filePath` values (#5789, #5787, #5785).
+
+**Full changelog:** https://github.com/thedotmack/claude-mem/compare/v15.15.2...v15.16.0
+
+## [15.15.2] - 2026-11-10
+
+## Critical fix
+
+- **Antigravity no longer denies every tool call after an upgrade from 14.x (#5670):** an in-place upgrade from an older install left a `PreToolUse` hook (and a `PreInvocation` context hook) in `~/.gemini/config/hooks.json`. agy kept firing it before every tool call, the current adapter answered with no decision, and agy denied every call until you re-ran install. Now the Antigravity installer finds those stale entries and migrates the file in place with the same merge install performs. It writes only when something is stale, never throws, and leaves a corrupt file untouched. The worker runs this heal on startup and on Antigravity hook calls, so updating is enough. Thanks to @jiezhiyong for the report (#5665) and to @0xABCD01 for the fix.
+
+## Fixes
+
+- **Antigravity:** a model call that only called tools no longer becomes an "AntigravityProvider returned Completed" memory. Only a step with a real reply is recorded, so the observer stops writing false memories like "stuck in a retry loop" (#5667, thanks @ryrenz; reported in #5665 by @jiezhiyong).
+- **Redaction:** with `CLAUDE_MEM_REDACT_ENABLED=true`, server capture now applies the configured redactor before the capture leaves your machine, and to session and event metadata before it is stored. Before, an untagged credential in an opening prompt or tool payload could be sent over HTTP unredacted (#5774, thanks @Afloat16).
+- **Doctor:** `claude-mem doctor` now checks the macOS launcher's code signature. A launcher macOS would kill gets a clear hint (`bun upgrade` first when Bun is below 1.4.1, otherwise `npx claude-mem install` rebuilds it); a launcher that still runs only warns (#5657, thanks @Kirat0201).
+- **cmem-pro 0.2.1:** the Cowork plugin version is bumped so installed copies pick up the redaction and failed-capture fixes made after 0.2.0.
+
+## New
+
+- **Turkish My Work:** the My Work page is now available in Turkish (#5656, thanks @Kirat0201).
+
+**Full changelog:** https://github.com/thedotmack/claude-mem/compare/v15.15.1...v15.15.2
+
 ## [15.15.1] - 2026-11-10
 
 ## No replay after an outage
