@@ -3,6 +3,7 @@ import type { DeepSearchResult } from '../services/sqlite/tool-use-search.js';
 import { logger } from '../utils/logger.js';
 import { projectMemoryContent } from '../shared/progressive-search.js';
 import { retainTextHeadTail } from '../shared/text-truncation.js';
+import { isMemorySaveRefusalReason, type MemorySaveRefusalReason } from '../shared/memory-save-refusal.js';
 
 export type McpTextPurpose = 'save' | 'observation-add' | 'event' | 'search' | 'server-search' | 'server-timeline' | 'context' | 'job'
   | 'observations' | 'tool-uses' | 'corpus-list' | 'corpus-build' | 'corpus-prime' | 'corpus-query';
@@ -48,8 +49,13 @@ function rows(payload: unknown, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 function identity(row: Record<string, unknown>): string {
+  // Provenance: which agent made this record. Server rows are camelCase, local
+  // rows snake_case; rows from before provenance carry neither and get no tag.
+  const platform = row.platformSource ?? row.platform_source;
+  const via = typeof platform === 'string' && platform.trim() ? ` [via ${line(platform.trim(), '', 100)}]` : '';
   return `#${line(row.id, '?', 100)} — ${line(row.title ?? record(row.metadata).title, 'Memory', 180)}`
-    + (row.project || row.projectId ? ` (${line(row.project ?? row.projectId, '', 100)})` : '');
+    + (row.project || row.projectId ? ` (${line(row.project ?? row.projectId, '', 100)})` : '')
+    + via;
 }
 function recordedAt(row: Record<string, unknown>): string {
   // Older SQLite rows use seconds. Server createdAtEpoch is already in milliseconds.
@@ -116,12 +122,28 @@ function corpusSummary(value: unknown): string {
     + (corpus.description ? `\n${line(corpus.description, '', 300)}` : '');
 }
 
+/** Words for each reason the worker refuses a save_memory write (src/shared/memory-save-refusal.ts). */
+const SAVE_REFUSAL_TEXT: Record<MemorySaveRefusalReason, string> = {
+  project_excluded: 'Not saved: this checkout is excluded by CLAUDE_MEM_EXCLUDED_PROJECTS.',
+};
+
 /** Select model-visible information explicitly. Unknown backend fields are never dumped into the prompt. */
 export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): McpTextResult {
   const data = record(payload);
   let text: string;
+  let isError = false;
   switch (purpose) {
     case 'save':
+      if (data.success === false || data.skipped === true) {
+        // The worker refused the write (for example project_excluded). Saying
+        // "Saved memory #?" here told the caller a note it never stored (#6098).
+        const reason = typeof data.reason === 'string' ? data.reason : '';
+        isError = true;
+        text = isMemorySaveRefusalReason(reason)
+          ? SAVE_REFUSAL_TEXT[reason]
+          : `Not saved${reason ? `: ${line(reason)}.` : '.'}`;
+        break;
+      }
       text = data.duplicate ? `Memory already saved as #${line(data.id, '?')}.`
         : `Saved memory #${line(data.id, '?')}: ${line(data.title, 'Untitled')}.`;
       if (data.project) text += ` Project: ${line(data.project)}.`;
@@ -239,7 +261,7 @@ export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): Mcp
       break;
     }
   }
-  return mcpTextResult(text);
+  return mcpTextResult(text, isError);
 }
 
 /** Existing Markdown endpoints stay readable; accidental JSON text is converted by its declared purpose. */
