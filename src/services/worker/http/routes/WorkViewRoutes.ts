@@ -1,7 +1,7 @@
 import type express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, join } from 'node:path';
 import { z } from 'zod';
@@ -20,7 +20,7 @@ import { FILE_CONTENT_TYPES } from '../../../work-view/work-product.mjs';
 import { isInsideDeliverablesDir } from '../../../../shared/deliverables.js';
 import { contentFingerprint, priorContentFingerprint, LocalReviewStore } from '../../../work-view/review-store.js';
 import { MY_RULES_LIST, renderRulesFile, ruleRowFields, type SavedRule } from '../../../work-view/my-rules.mjs';
-import { claudeCodeImportLine, homeRelativePath, RULES_AND_TOOLS_FILENAME } from '../../../../shared/claude-code-rules-import.js';
+import { claudeCodeImportLine, hasImportLine, homeRelativePath, RULES_AND_TOOLS_FILENAME } from '../../../../shared/claude-code-rules-import.js';
 import { ensureRulesAndToolsFile } from '../../../context/RulesAndToolsFile.js';
 import { focusAreaRowFields, MY_FOCUS_LIST, navWordIn, OTHER_FOCUS_AREA_ID, ownerGoalsAreaRows, placementRowFields, PROPOSAL_KINDS, readFocus, routerFocusRows, seedFocusRows, seedUndoRows, type FocusArea, type RouterFocusBody } from '../../../work-view/my-focus.mjs';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
@@ -38,6 +38,7 @@ import { FocusSharePublisher } from '../../../work-view/focus-share-publisher.js
 import { cmemProOrigin } from '../../../../shared/cmem-gateway.js';
 import { isOpenRouterApiUrl } from '../../../../shared/openrouter-base-url.js';
 import { FOCUS_CHANGED_MESSAGE, focusChangeVersion } from '../../../../shared/focus-change-version.js';
+import { REFRESH_START_REFUSAL } from '../../../../shared/work-view-refresh-reasons.js';
 import { runAgentTask } from '../../../agent-runner/run.js';
 import { ledgerSignature, readLedger } from '../../../work-view/request-groups.mjs';
 import { configuredJudge, decideSuggestion, jevClientFromSettings } from '../../../work-view/request-judge.mjs';
@@ -1322,7 +1323,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
       path: homeRelativePath(this.rulesFilePath),
       instructionsPath: homeRelativePath(this.claudeInstructionsPath),
       approvedCount: renderRulesFile(rules).approvedCount,
-      loadedInClaudeCode: instructions.split('\n').some(line => line.trim() === myRulesImportLine(this.rulesFilePath)),
+      // Any spelling Claude Code loads counts (`@~/…` or an absolute `/` path), not only the one this worker writes.
+      loadedInClaudeCode: hasImportLine(instructions, this.rulesFilePath),
     };
   }
 
@@ -1355,9 +1357,16 @@ export class WorkViewRoutes extends BaseRouteHandler {
     // The import must never point at a missing file: Claude Code skips it without a word. SessionStart
     // keeps its text current (mode, runtime, settings), so only a missing file is written here.
     if (!existsSync(this.rulesAndToolsPath)) ensureRulesAndToolsFile(true, this.rulesAndToolsPath);
-    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${process.pid}.tmp`);
-    writeFileSync(temp, this.renderRulesMarkdown(rules), { mode: 0o644 });
-    renameSync(temp, this.rulesFilePath);
+    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temp, this.renderRulesMarkdown(rules), { mode: 0o644, flag: 'wx' });
+      renameSync(temp, this.rulesFilePath);
+    } catch (error) {
+      // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+      // would otherwise leave this randomly named temp behind on every attempt.
+      try { unlinkSync(temp); } catch { /* the temp may not exist */ }
+      throw error;
+    }
   }
 
   private saveRule = async (req: Request, res: Response): Promise<void> => {
@@ -1710,7 +1719,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** Starts an on-demand refresh and answers before the run ends, which can take many minutes. */
   private startManualRefresh = async (_req: Request, res: Response): Promise<void> => {
-    if (!this.autoRefresh) { res.status(503).json({ error: 'Refresh is unavailable on this worker.' }); return; }
+    if (!this.autoRefresh) { res.status(503).json({ error: REFRESH_START_REFUSAL.unavailable }); return; }
     const started = this.autoRefresh.runNow({ reason: 'manual' });
     // runNow decides before its first await: busy now means a run started, and any other answer is already settled.
     if (this.autoRefresh.busy) {
@@ -1719,8 +1728,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
       return;
     }
     const state = await started;
-    if (state === 'setup-running') { res.status(409).json({ error: 'Refresh is unavailable until setup finishes.' }); return; }
-    if (state === 'closed') { res.status(503).json({ error: 'This worker is shutting down.' }); return; }
+    if (state === 'setup-running') { res.status(409).json({ error: REFRESH_START_REFUSAL.setupRunning }); return; }
+    if (state === 'closed') { res.status(503).json({ error: REFRESH_START_REFUSAL.shuttingDown }); return; }
     res.status(state === 'running' ? 202 : 200).json({ state });
   };
 

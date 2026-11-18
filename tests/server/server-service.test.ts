@@ -94,6 +94,42 @@ describe('ServerService', () => {
     const body = await info.json();
     expect(body.runtime).toBe('server-beta');
     expect(body.boundaries.queueManager.status).toBe('disabled');
+    // The route is unauthenticated and reachable over the container network,
+    // so it publishes state a probe reads and not the deployment's internals.
+    expect(body.authMode).toBeUndefined();
+    expect(body.postgres.schemaVersion).toBeUndefined();
+    expect(typeof body.postgres.initialized).toBe('boolean');
+    expect(Object.keys(body.boundaries.queueManager)).toEqual(['status']);
+    expect(Object.keys(body.boundaries.generationWorkerManager)).toEqual(['status']);
+    // vectorSearch keeps the shape docs/public/hosted-server.mdx documents.
+    expect(typeof body.vectorSearch.available).toBe('boolean');
+    expect(typeof body.vectorSearch.model).toBe('string');
+    expect(body.vectorSearch).toHaveProperty('observationsWithoutVectors');
+    expect(body.vectorSearch).toHaveProperty('lastEmbedError');
+    expect(body.vectorSearch.error).toBeUndefined();
+  });
+
+  it('logs why /v1/info could not read vector search, while the response leaves the error out', async () => {
+    service = new ServerService({
+      graph: createStubGraph(),
+      port: 0,
+      host: '127.0.0.1',
+      persistRuntimeState: false,
+    });
+    await service.start();
+    const address = service.getRuntimeState();
+
+    // The stub pool refuses every query, so the vector search probe fails.
+    const info = await fetch(`http://127.0.0.1:${address.port}/v1/info`);
+    expect(info.status).toBe(200);
+    const body = await info.json();
+    expect(body.vectorSearch.available).toBe(false);
+    expect(JSON.stringify(body)).not.toContain('stub pool');
+    const vectorWarnings = (logger.warn as unknown as ReturnType<typeof spyOn>).mock.calls
+      .filter(call => call[1] === 'Vector search status could not be read for /v1/info');
+    expect(vectorWarnings).toHaveLength(1);
+    expect(vectorWarnings[0][0]).toBe('SYSTEM');
+    expect((vectorWarnings[0][3] as Error).message).toContain('stub pool: query not supported in this test');
   });
 
   // Phase 4 integration test: Postgres-backed v1 events route must enforce
