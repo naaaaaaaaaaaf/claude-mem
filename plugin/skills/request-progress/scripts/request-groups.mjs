@@ -1363,13 +1363,15 @@ var init_SettingsDefaultsManager = __esm({
         CLAUDE_MEM_WORK_VIEW_COPY_MODEL: "",
         // Optional model override for generated My Work copy; empty uses the selected provider's configured model
         CLAUDE_MEM_WORK_VIEW_AGENT: "",
-        // Which agent runs the My Work refresh: '' follows CLAUDE_MEM_PROVIDER and stays on one agent; claude-code/codex/gemini pick one; off runs none; all falls through every logged-in agent (#5189)
+        // Which agent runs the My Work refresh: '' follows CLAUDE_MEM_PROVIDER and stays on one agent; claude-code/codex/gemini/opencode pick one; off runs none; all falls through every logged-in agent (#5189)
         CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL: "",
         // #5164 — model for every My Work refresh step on Claude Code (an alias like 'haiku'); empty keeps haiku/sonnet per step
         CLAUDE_MEM_WORK_VIEW_CODEX_MODEL: "",
         // #5164 — same for Codex; empty keeps the per-step table
         CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL: "",
         // #5164 — same for Gemini; empty keeps flash-lite/flash per step
+        CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL: "",
+        // #5535 — model for every My Work refresh step on OpenCode ('provider/model'); empty uses OpenCode's configured default
         CLAUDE_MEM_WORK_VIEW_API_MODEL: "",
         // Model for every My Work refresh step on the selected API provider; empty keeps the provider's configured model
         CLAUDE_MEM_CORPUS_AGENT: "",
