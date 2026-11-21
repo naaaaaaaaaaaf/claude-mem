@@ -483,11 +483,37 @@ var SESSION_START_CARD_FILE_KEY = "claude_mem_session_start_card_file";
 var SESSION_START_CARD_FOLDER = "session-start-card";
 var SESSION_START_CARD_SOURCES = ["startup", "clear", "compact"];
 var FILE_NAME_SAFE_SESSION_ID = /^[A-Za-z0-9_-]+$/;
+var SLOT_FILE_NAME = /^[A-Za-z0-9_-]+\.\d+\.json$/;
 function isFileNameSafeSessionId(sessionId) {
   return typeof sessionId === "string" && FILE_NAME_SAFE_SESSION_ID.test(sessionId);
 }
+function isSessionStartCardSlotFileName(fileName) {
+  return SLOT_FILE_NAME.test(fileName);
+}
+function isSessionStartCardSlotFileNameOf(fileName, sessionId) {
+  return isFileNameSafeSessionId(sessionId) && isSessionStartCardSlotFileName(fileName) && fileName.startsWith(`${sessionId}.`) && /^\d+\.json$/.test(fileName.slice(sessionId.length + 1));
+}
 function sessionStartCardSlotPath(pluginDataDirectory, sessionId, startedAtEpochMs) {
   return `${pluginDataDirectory.replace(/[\\/]+$/, "")}/${SESSION_START_CARD_FOLDER}/${sessionId}.${startedAtEpochMs}.json`;
+}
+function sessionStartCardSlotClockOf(fileName, sessionId) {
+  if (!isSessionStartCardSlotFileNameOf(fileName, sessionId)) return null;
+  const clockEpochMs = Number(fileName.slice(sessionId.length + 1, -".json".length));
+  return Number.isSafeInteger(clockEpochMs) ? clockEpochMs : null;
+}
+var SESSION_START_CARD_REQUEST_LOOK_EVERY_MS = 200;
+var SESSION_START_CARD_REQUEST_WAIT_MS = 8e3;
+function sessionStartCardRequestPath(pluginDataDirectory, sessionId, askedAtEpochMs) {
+  return `${pluginDataDirectory.replace(/[\\/]+$/, "")}/${SESSION_START_CARD_FOLDER}/${sessionId}.${askedAtEpochMs}.request`;
+}
+function newestSessionStartCardSlotSince(fileNames, sessionId, notBeforeEpochMs) {
+  let newest = null;
+  for (const fileName of fileNames) {
+    const clockEpochMs = sessionStartCardSlotClockOf(fileName, sessionId);
+    if (clockEpochMs === null || clockEpochMs < notBeforeEpochMs) continue;
+    if (newest === null || clockEpochMs > newest.clockEpochMs) newest = { fileName, clockEpochMs };
+  }
+  return newest;
 }
 
 // src/mods/session-start-card/card.ts
@@ -617,6 +643,7 @@ function sessionStartMark(columns, rows = Infinity) {
 // src/mods/session-start-card/register.ts
 var CARD_TITLE = "claude-mem";
 var MAX_LINES_BESIDE_MARK = 15;
+var NO_BANNER_FOUND_LINE = `claude-mem: the session-start card found no banner in the ${SESSION_START_CARD_REQUEST_WAIT_MS / 1e3} s after the session started, and stopped looking`;
 function cardNotShownLine(error) {
   return `claude-mem: the session-start card is not shown: ${error instanceof Error ? error.message : String(error)}`;
 }
@@ -624,6 +651,7 @@ function registerSessionStartCard(on) {
   let card = null;
   let isFullscreen = null;
   let waitingForHookRows = null;
+  let sessionWithNamedSlot = null;
   on("classic.SessionStart", async ($, e, next) => {
     waitingForHookRows = null;
     if (!drawsSessionStartCard(e.source, isFullscreen) || !isFileNameSafeSessionId(e.session_id)) return next(e);
@@ -648,6 +676,7 @@ function registerSessionStartCard(on) {
       result = await next(e);
     } else {
       const slotFile = slotPath;
+      sessionWithNamedSlot = e.session_id;
       result = await next({ ...e, [SESSION_START_CARD_FILE_KEY]: slotFile });
       try {
         if (await $.fs.exists(slotFile)) {
@@ -705,6 +734,86 @@ function registerSessionStartCard(on) {
       return keptRow;
     }
   );
+  on("session.start", { isInteractive: true }, async ($, e, next) => {
+    try {
+      if (await $.env.get("CLAUDE_CODE_ENTRYPOINT") === TERMINAL_ENTRYPOINT) {
+        const engine = await $.session.version();
+        if (supportsSessionStartCard(engine.base ?? engine.version)) {
+          const sessionId = await $.session.id();
+          const pluginDataDirectory = (await $.process.hookEnv()).CLAUDE_PLUGIN_DATA;
+          if (pluginDataDirectory && isFileNameSafeSessionId(sessionId) && sessionWithNamedSlot !== sessionId) {
+            const slotFolder = `${pluginDataDirectory.replace(/[\\/]+$/, "")}/${SESSION_START_CARD_FOLDER}`;
+            const askedAtEpochMs = await $.clock.now();
+            await $.fs.write(sessionStartCardRequestPath(pluginDataDirectory, sessionId, askedAtEpochMs), "");
+            let isLooking = false;
+            let hasStoppedLooking = false;
+            const stopLooking = () => {
+              hasStoppedLooking = true;
+              looks.cancel();
+            };
+            const looks = $.clock.every(SESSION_START_CARD_REQUEST_LOOK_EVERY_MS, async () => {
+              if (hasStoppedLooking) return;
+              try {
+                const isWaitOver = await $.clock.now() - askedAtEpochMs >= SESSION_START_CARD_REQUEST_WAIT_MS;
+                if (hasStoppedLooking) return;
+                if (isLooking) {
+                  if (!isWaitOver) return;
+                  stopLooking();
+                  $.ui.log(NO_BANNER_FOUND_LINE, { to: "debug" });
+                  return;
+                }
+                isLooking = true;
+                try {
+                  if (sessionWithNamedSlot === sessionId) {
+                    stopLooking();
+                    return;
+                  }
+                  const slot = newestSessionStartCardSlotSince(
+                    (await $.fs.list(slotFolder)).map((entry) => entry.name),
+                    sessionId,
+                    askedAtEpochMs
+                  );
+                  if (sessionWithNamedSlot === sessionId) {
+                    stopLooking();
+                    return;
+                  }
+                  if (slot === null) {
+                    if (!isWaitOver || hasStoppedLooking) return;
+                    stopLooking();
+                    $.ui.log(NO_BANNER_FOUND_LINE, { to: "debug" });
+                    return;
+                  }
+                  stopLooking();
+                  const slotFile = `${slotFolder}/${slot.fileName}`;
+                  const lines = sessionStartCardLines(await $.fs.read(slotFile));
+                  if (!lines) throw new Error(`${slotFile} holds no banner`);
+                  const requestedCard = { rowId: `session-start-${slot.clockEpochMs}`, lines };
+                  const cardBeforeThisStart = card;
+                  card = requestedCard;
+                  try {
+                    const placed = await $.ui.place({ id: requestedCard.rowId });
+                    if (!placed.isPlaced && placed.requestId === void 0) throw new Error(placed.reason);
+                    $.ui.invalidate("ui.render");
+                  } catch (error) {
+                    card = cardBeforeThisStart;
+                    throw error;
+                  }
+                } finally {
+                  isLooking = false;
+                }
+              } catch (error) {
+                stopLooking();
+                $.ui.log(cardNotShownLine(error));
+              }
+            });
+          }
+        }
+      }
+    } catch (error) {
+      $.ui.log(cardNotShownLine(error), { to: "debug" });
+    }
+    return next(e);
+  });
   on("ui.render", { component: "Placed" }, async ($, e, next) => {
     if (e.surface === TERMINAL_SURFACE && typeof e.viewport?.isFullscreen === "boolean") isFullscreen = e.viewport.isFullscreen;
     if (!card || e.props.plugin !== $.plugin.name || e.props.id !== card.rowId) return next(e);
