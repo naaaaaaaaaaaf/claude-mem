@@ -25,7 +25,7 @@ const loginClaim = `/api/pro/trial/claim?pairing=${pairingId}&login_only=1`;
 const authorizationUrl = `https://cmem.ai/login?next=${encodeURIComponent(loginClaim)}`;
 const checkoutUrl = `https://cmem.ai/api/pro/trial/claim?pairing=${pairingId}&trial=7`;
 
-function runCompletedPairingChild(body: Record<string, unknown>, initialSettings?: Record<string, string>, cloudSyncOffer?: SetupCloudSyncOffer): {
+function runCompletedPairingChild(body: Record<string, unknown>, initialSettings?: Record<string, string>, cloudSyncOffer?: SetupCloudSyncOffer, shareWorkView?: true, env?: Record<string, string>): {
   output: string;
   settings: Record<string, string>;
   settingsMode: number;
@@ -47,6 +47,7 @@ function runCompletedPairingChild(body: Record<string, unknown>, initialSettings
         authorizationUrl: 'https://cmem.ai/login',
         checkoutUrl: 'https://cmem.ai/api/pro/trial/claim?pairing=test&trial=7',
         cloudSyncOffer: ${JSON.stringify(cloudSyncOffer)},
+        shareWorkView: ${JSON.stringify(shareWorkView)},
       };
       const result = await completeInstallerOAuthLogin(pairing, 'test-version');
       console.log('__PAIRING_RESULT__=' + JSON.stringify({ plan: pairing.delivered?.plan, ready: result }));
@@ -57,6 +58,7 @@ function runCompletedPairingChild(body: Record<string, unknown>, initialSettings
         ...process.env,
         CLAUDE_MEM_DATA_DIR: dataDir,
         CLAUDE_MEM_TELEMETRY: '0',
+        ...env,
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -132,6 +134,20 @@ describe('standalone Cloud Sync installer contract', () => {
     expect(parseInstallerOAuthStartBody(validStartBody)?.checkoutUrl).toBe(checkoutUrl);
   });
 
+  it('enables the board only for an explicitly selected and approved compatible Cloud Sync device', () => {
+    const ready = { status: 'ready', user_id: 'fixture-owner', setup_token: 'fixture-setup-token', plan: 'cloud_sync', hub_url: 'https://sync.cmem.ai' };
+    const flag = 'CLAUDE_MEM_WORK_VIEW_SHARED_STATE';
+    const offer = 'cloud_sync_monthly';
+    expect(runCompletedPairingChild(ready, {}, offer, true).settings[flag]).toBe('true');
+    expect(runCompletedPairingChild(ready, { [flag]: '' }, offer, true).settings[flag]).toBe('true');
+    expect(runCompletedPairingChild(ready, { [flag]: 'false' }, offer, true).settings[flag]).toBe('false');
+    expect(runCompletedPairingChild(ready, {}, offer, true, { [flag]: 'false' }).settings[flag]).toBeUndefined();
+    expect(runCompletedPairingChild(ready, {}, offer).settings[flag]).toBeUndefined();
+    expect(runCompletedPairingChild(ready, {}, undefined, true).settings[flag]).toBeUndefined();
+    expect(runCompletedPairingChild({ ...ready, hub_url: 'https://custom-hub.test' }, {}, offer, true).settings[flag]).toBeUndefined();
+    expect(runCompletedPairingChild(ready, {}, offer, true, { CLAUDE_MEM_CLOUD_SYNC_HUB_URL: 'https://custom-hub.test' }).settings[flag]).toBeUndefined();
+  });
+
   it('persists only Cloud credentials and keeps the configured observer and its credentials', () => {
     const initial = {
       CLAUDE_MEM_PROVIDER: 'gemini',
@@ -152,7 +168,8 @@ describe('standalone Cloud Sync installer contract', () => {
       CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID: '',
       CLAUDE_MEM_CLOUD_SYNC_DEVICE_NAME: expect.any(String),
     });
-    expect(settingsMode).toBe(0o600);
+    // Windows has no POSIX permission bits: stat reports 0o666 for a writable file.
+    if (process.platform !== 'win32') expect(settingsMode).toBe(0o600);
   });
 
   it('rejects bundled or hosted credential delivery for a Cloud-only pairing before writing settings', () => {
@@ -862,7 +879,8 @@ describe('installer trial-ready contract', () => {
     expect(settings.CLAUDE_MEM_PRO_MEMORY_KEY).toBe('MEMORY_KEY_MUST_NOT_LEAK');
     expect(settings).not.toHaveProperty('CLAUDE_MEM_PROVIDER');
     expect(settings).not.toHaveProperty('CLAUDE_MEM_OPENROUTER_API_KEY');
-    expect(settingsMode).toBe(0o600);
+    // Windows has no POSIX permission bits: stat reports 0o666 for a writable file.
+    if (process.platform !== 'win32') expect(settingsMode).toBe(0o600);
   });
 
   it('persists a seat-only ready response as the sync connection alone, leaving the observer as it was', () => {

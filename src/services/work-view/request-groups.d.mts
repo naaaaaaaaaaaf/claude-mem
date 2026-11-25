@@ -79,6 +79,7 @@ export function validateGroupingAnswer<T>(answer: T, input: GroupingInput, optio
 export interface StoryPreference { preference: string; kind: string; supportCount: number; quotes: Array<{ quote: string; at: string | null }> }
 export interface ValidatedStory { narrative: string; preferences: StoryPreference[] }
 export function validateStory(story: any): ValidatedStory;
+export function trimStoryPreferences(story: any, coercedFields?: Set<string>): any;
 export interface StoryPart { part: string; chars: number; words: number; budgetChars: number; budgetWords: number; overBudgetChars: number }
 export interface StoryInput {
   groups: number; update: boolean; narrativeTarget: number; narrativeLimit: number;
@@ -88,3 +89,7 @@ export interface StoryInput {
   previousStory: (Record<string, any> & { narrative: string; preferences: any[] }) | null;
 }
 export function storyInput(groups: number, reviews: any[], story: (Record<string, any> & { narrative: string; preferences?: any[]; writtenAt?: string }) | null): StoryInput;
+export function applyGroupDecisions(
+  stored: Record<string, unknown>, decisions: { groups: Array<Record<string, unknown>>; ignored?: string[] },
+  now?: number, options?: { projectOf?: Map<string, string>; getProjectRoot?: (project: unknown) => string | null },
+): Record<string, unknown>;

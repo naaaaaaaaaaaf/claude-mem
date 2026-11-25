@@ -19,9 +19,11 @@ import type { UsableAgentId } from '../agent-runner/detect.js';
 import { cutOutputText, runCommand } from '../agent-runner/detect.js';
 import { writeOwnerPromptsFile, type OwnerPromptsFile } from '../prompt-import/owner-prompts-file.js';
 import { resolvePythonCommand } from './python.js';
+import { parseBoundedNumber } from '../../shared/bounded-setting.js';
+import { DEFAULT_API_AGENT_LIMITS, type ApiAgentLimits } from '../../shared/api-agent-limits.js';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import { logger } from '../../utils/logger.js';
-import { FOCUS_BATCH, readGoals, readLedger, runCli, storyInput as buildStoryInput, TITLE_BATCH, validateFocusAnswer, validateGroupingAnswer, validateStory, validateTitleAnswer, type FocusInput, type FocusRequestRecord, type LedgerDatabase, type RefreshNeeds } from './request-groups.mjs';
+import { FOCUS_BATCH, readGoals, readLedger, runCli, storyInput as buildStoryInput, TITLE_BATCH, validateFocusAnswer, validateGroupingAnswer, validateStory, trimStoryPreferences, validateTitleAnswer, type FocusInput, type FocusRequestRecord, type LedgerDatabase, type RefreshNeeds } from './request-groups.mjs';
 import { FOCUS_AUTO_PLACE_THRESHOLD, judgeFocusBatch, placesAlone, type FocusJudge, type FocusJudgement } from './focus-judge.mjs';
 import { isWithdrawnArea, ownerGoalsAreaRows, ownerGoalsSaveKey, PROPOSAL_KINDS, readFocusAreas, routerFocusRows, type FocusArea, type RouterFocusBody } from './my-focus.mjs';
 import { NAV_LABELS } from './nav-words.mjs';
@@ -88,6 +90,7 @@ export function resolveStepModels(dataDir: string): Record<Step, StepModels> {
 export const WORK_VIEW_AGENT_CHOICES = ['', 'claude-code', 'codex', 'gemini', 'opencode', 'api', 'off', 'all'] as const;
 
 export interface RefreshAgentChoice {
+  apiLimits?: ApiAgentLimits;
   /** The only agents the refresh may run on; absent means every logged-in agent. */
   allowedAgents?: TaskAgentId[];
   /** Tried first when it is logged in (#5435). */
@@ -97,6 +100,29 @@ export interface RefreshAgentChoice {
 }
 
 const LOCAL_AGENT_IDS: readonly UsableAgentId[] = ['claude-code', 'codex', 'gemini', 'opencode'];
+
+const warnedApiAgentLimits = new Set<string>();
+
+/** One limit setting, or its default. A set but invalid value warns once per value, naming the default used. */
+function apiAgentLimit(key: 'CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS' | 'CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS', raw: unknown, max: number, defaultValue: number): number {
+  const parsed = parseBoundedNumber(raw as string | number | undefined, { min: 1, max, integer: true });
+  if (parsed !== null) return parsed;
+  const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : '';
+  if (text && !warnedApiAgentLimits.has(`${key}=${text}`)) {
+    warnedApiAgentLimits.add(`${key}=${text}`);
+    logger.warn('WORKER', `Invalid ${key}; the My Work API refresh uses the default`, { value: text, min: 1, max, default: defaultValue });
+  }
+  return defaultValue;
+}
+
+/** CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS and CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS, read at the start of every refresh. */
+function resolveApiAgentLimits(settings: SettingsDefaults): ApiAgentLimits {
+  return {
+    // Longer delays overflow a signed 32-bit runtime timer and can expire immediately.
+    timeoutMs: apiAgentLimit('CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS', settings.CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS, 2_147_483_647, DEFAULT_API_AGENT_LIMITS.timeoutMs),
+    maxOutputTokens: apiAgentLimit('CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS', settings.CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS, Number.MAX_SAFE_INTEGER, DEFAULT_API_AGENT_LIMITS.maxOutputTokens),
+  };
+}
 
 /** Which agents the My Work refresh may run on (#5189). A background refresh that falls through to another
  * agent spends that agent's quota without the owner asking: a Claude Code session limit sent ~230 hidden
@@ -109,22 +135,28 @@ const LOCAL_AGENT_IDS: readonly UsableAgentId[] = ['claude-code', 'codex', 'gemi
  *   ('openrouter', 'openai-compatible', 'cmem') runs the first logged-in agent in detect order, and only that one.
  *   The API provider itself runs the refresh only when the owner sets `api`: it spends that provider's credit.
  * The worker builds a fresh task for every run, so a settings change applies to the next refresh. */
-export function resolveRefreshAgents(dataDir: string): RefreshAgentChoice {
+export function resolveRefreshAgents(dataDir: string, setup = false): RefreshAgentChoice {
   const settings = SettingsDefaultsManager.loadFromFile(join(dataDir, 'settings.json'), true, { readOnly: true });
   const provider = String(settings.CLAUDE_MEM_PROVIDER ?? '').trim();
   const providerAgent: TaskAgentId | undefined = provider === 'claude' ? 'claude-code'
     : provider === 'codex' || provider === 'gemini' ? provider : undefined;
   const configuredAgent = String(settings.CLAUDE_MEM_WORK_VIEW_AGENT ?? '').trim();
   if (configuredAgent === 'off') return { allowedAgents: [], stayOnFirstUsableAgent: true };
-  if (configuredAgent === 'all') return { preferredAgent: providerAgent, stayOnFirstUsableAgent: false };
+  // `all` can fall through to the api agent too, so it gets the same limits as `api`.
+  if (configuredAgent === 'all') return { preferredAgent: providerAgent, stayOnFirstUsableAgent: false, apiLimits: resolveApiAgentLimits(settings) };
   const namedAgent = LOCAL_AGENT_IDS.find(agent => agent === configuredAgent);
   if (namedAgent) return { allowedAgents: [namedAgent], preferredAgent: namedAgent, stayOnFirstUsableAgent: true };
-  if (configuredAgent === 'api') return { allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true };
+  if (configuredAgent === 'api') {
+    return { allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true, apiLimits: resolveApiAgentLimits(settings) };
+  }
   if (configuredAgent) {
     logger.warn('WORKER', 'Unrecognized CLAUDE_MEM_WORK_VIEW_AGENT; the My Work refresh follows CLAUDE_MEM_PROVIDER instead', {
       value: configuredAgent, accepted: WORK_VIEW_AGENT_CHOICES.filter(Boolean).join(', '),
     });
   }
+  // Initial setup prefers the configured CLI. If it is absent, an already signed-in CLI can do the
+  // work. Once a usable CLI starts, stay on its account. A specifically chosen Work View agent above wins.
+  if (setup) return { preferredAgent: providerAgent, stayOnFirstUsableAgent: true };
   if (providerAgent) return { allowedAgents: [providerAgent], preferredAgent: providerAgent, stayOnFirstUsableAgent: true };
   return { stayOnFirstUsableAgent: true };
 }
@@ -938,7 +970,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
         };
         let previous: { narrative: string; preferences: any[] } | null = null;
         let remaining = storyInput.reviews as any[];
-        let parts = 0;
+        let parts = 0, storyPreferencesTrimmed = 0;
         while (remaining.length) {
           const batch = packStoryBatch(remaining, previous);
           remaining = remaining.slice(batch.length);
@@ -947,15 +979,17 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
           const last = !remaining.length;
           questionBudget = { bytes: OWNER_GOALS_QUESTION_BYTES, refusal: 'This story question exceeds the input budget, including its refused answer. Nothing was recorded; no review was skipped.' };
           try {
-            await step('story', storyQuestion(input), async answer => {
-              if (last) return cli(['record-story'], answer, { now: storyReadAt });
-              previous = validateStory(answer);
-              return previous;
+            await step('story', storyQuestion(input), async (answer, retry) => {
+              const trimmed = new Set<string>();
+              if (retry) answer = trimStoryPreferences(answer, trimmed);
+              const saved = last ? cli(['record-story'], answer, { now: storyReadAt }) : (previous = validateStory(answer));
+              storyPreferencesTrimmed += trimmed.size;
+              return saved;
             });
           } finally { questionBudget = null; }
           parts++;
         }
-        done.push(`${storyInput.update ? 'story updated' : 'story written'}${parts > 1 ? ` in ${parts} parts` : ''}`);
+        done.push(`${storyInput.update ? 'story updated' : 'story written'}${parts > 1 ? ` in ${parts} parts` : ''}${storyPreferencesTrimmed ? ` (${storyPreferencesTrimmed} story preferences trimmed after retry)` : ''}`);
       }
       // Held so focus and the story still ran. When both failed, the run's error names both.
       const heldFailures = [namingError, focusError].filter(error => error != null);
@@ -974,7 +1008,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
     reason,
     steps,
     // The refresh runs on the agent the owner's settings name, and stays there (#5189, #5435).
-    ...resolveRefreshAgents(dataDir),
+    ...resolveRefreshAgents(dataDir, reason === 'setup-scan'),
     // The work-view folder holds every input file; the data dir above it holds .env and settings.json.
     cwd: ledgerDir,
     claudeCode: {
