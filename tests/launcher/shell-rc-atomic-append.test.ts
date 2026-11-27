@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import {
   ensureLocalBinOnShellPath,
   shellPathSetupMarkerComment,
+  SKIP_SHELL_RC_ENV_VAR,
   type LauncherHostEnvironment,
   type LauncherInstallLogger,
 } from '../../src/launcher/install-launcher.js';
@@ -123,5 +124,104 @@ describe('ensureLocalBinOnShellPath writes the rc atomically', () => {
     expect(readFileSync(zshrc, 'utf-8')).toBe(
       `\n${shellPathSetupMarkerComment('claude-mem')}\nexport PATH="$HOME/.local/bin:$PATH"\n`,
     );
+  });
+});
+
+describe('ensureLocalBinOnShellPath recognizes every common spelling of the directory', () => {
+  let home: string;
+
+  beforeAll(() => {
+    mkdirSync(scratchParentDirectory, { recursive: true });
+  });
+
+  beforeEach(() => {
+    home = makeScratchHome();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const alreadyConfiguredSpellings = [
+    'export PATH=~/.local/bin:$PATH',
+    'export PATH="${HOME}/.local/bin:$PATH"',
+  ];
+
+  for (const line of alreadyConfiguredSpellings) {
+    it(`leaves an rc containing ${line} untouched`, () => {
+      const zshrc = path.join(home, '.zshrc');
+      writeFileSync(zshrc, `${line}\n`, 'utf-8');
+
+      const outcome = ensureLocalBinOnShellPath({
+        purposeLabel: 'claude-mem',
+        logger: recordingLogger(),
+        host: posixHost(home),
+      });
+
+      expect(outcome).toBe('rc-file-already-configured');
+      expect(readFileSync(zshrc, 'utf-8')).toBe(`${line}\n`);
+    });
+  }
+
+  it('reports already-on-path when PATH names the directory with a trailing slash', () => {
+    const outcome = ensureLocalBinOnShellPath({
+      purposeLabel: 'claude-mem',
+      logger: recordingLogger(),
+      host: {
+        ...posixHost(home),
+        environmentVariables: { PATH: `/usr/bin:${home}/.local/bin/:/bin`, SHELL: '/bin/zsh' },
+      },
+    });
+
+    expect(outcome).toBe('already-on-path');
+    expect(existsSync(path.join(home, '.zshrc'))).toBe(false);
+  });
+});
+
+describe('ensureLocalBinOnShellPath honors CLAUDE_MEM_SKIP_SHELL_RC', () => {
+  let home: string;
+
+  beforeAll(() => {
+    mkdirSync(scratchParentDirectory, { recursive: true });
+  });
+
+  beforeEach(() => {
+    home = makeScratchHome();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function skipHost(value: string): LauncherHostEnvironment {
+    const host = posixHost(home);
+    host.environmentVariables[SKIP_SHELL_RC_ENV_VAR] = value;
+    return host;
+  }
+
+  for (const value of ['1', 'true', 'TRUE']) {
+    it(`leaves the rc untouched and reports rc-file-skipped for ${value}`, () => {
+      const rc = path.join(home, '.zshrc');
+      writeFileSync(rc, '# mine\n');
+      const logger = recordingLogger();
+
+      const host = skipHost(value);
+      const outcome = ensureLocalBinOnShellPath({ purposeLabel: 'claude-mem', logger, host });
+
+      expect(outcome).toBe('rc-file-skipped');
+      expect(readFileSync(rc, 'utf-8')).toBe('# mine\n');
+      expect(host.environmentVariables.PATH).toBe('/usr/bin:/bin');
+      expect(logger.lines.join('\n')).toContain(SKIP_SHELL_RC_ENV_VAR);
+    });
+  }
+
+  it('does not create an rc file that does not exist', () => {
+    ensureLocalBinOnShellPath({ purposeLabel: 'claude-mem', logger: recordingLogger(), host: skipHost('1') });
+    expect(existsSync(path.join(home, '.zshrc'))).toBe(false);
+  });
+
+  it('still appends when the variable is 0', () => {
+    const outcome = ensureLocalBinOnShellPath({ purposeLabel: 'claude-mem', logger: recordingLogger(), host: skipHost('0') });
+    expect(outcome).toBe('rc-file-updated');
   });
 });

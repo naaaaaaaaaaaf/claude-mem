@@ -267,12 +267,23 @@ export type ShellPathSetupOutcome =
   | 'already-on-path'
   | 'rc-file-already-configured'
   | 'rc-file-updated'
-  | 'rc-file-update-failed';
+  | 'rc-file-update-failed'
+  | 'rc-file-skipped';
+
+/** Set to 1 or true to keep the installer from editing shell rc files. */
+export const SKIP_SHELL_RC_ENV_VAR = 'CLAUDE_MEM_SKIP_SHELL_RC';
+
+/** Whether the person asked the installer to leave shell rc files alone. */
+export function isShellRcSkipRequested(environmentVariables: NodeJS.ProcessEnv): boolean {
+  const value = environmentVariables[SKIP_SHELL_RC_ENV_VAR];
+  return value !== undefined && ['1', 'true'].includes(value.trim().toLowerCase());
+}
 
 /**
  * Appends `export PATH="$HOME/.local/bin:$PATH"` to the user's shell rc when
  * `~/.local/bin` is not on PATH and the rc does not already mention it, then
  * prepends it to this process's PATH. Never rewrites existing rc content.
+ * `CLAUDE_MEM_SKIP_SHELL_RC=1` skips the rc edit and returns 'rc-file-skipped'.
  */
 export function ensureLocalBinOnShellPath(options: {
   purposeLabel: string;
@@ -284,14 +295,24 @@ export function ensureLocalBinOnShellPath(options: {
   const localBinDirectory = posixPath.join(host.homeDirectory, '.local', 'bin');
 
   const currentPath = host.environmentVariables.PATH ?? '';
-  if (currentPath.split(':').includes(localBinDirectory)) return 'already-on-path';
+  if (currentPath.split(':').some((entry) => entry.replace(/\/+$/, '') === localBinDirectory)) return 'already-on-path';
+
+  if (isShellRcSkipRequested(host.environmentVariables)) {
+    logger.info(
+      `${SKIP_SHELL_RC_ENV_VAR} is set, so ${purposeLabel} left your shell rc files alone. `
+      + `Keep ${localBinDirectory} on your PATH yourself.`,
+    );
+    return 'rc-file-skipped';
+  }
 
   const { path: configFile, shell } = detectShellConfigFile(
     host.homeDirectory,
     host.environmentVariables.SHELL ?? '',
     host.platform,
   );
-  const binPathLiteral = '$HOME/.local/bin';
+  // The spellings an rc uses for this directory: the absolute path, $HOME,
+  // ${HOME} and the unquoted tilde form.
+  const binPathLiterals = [localBinDirectory, '$HOME/.local/bin', '${HOME}/.local/bin', '~/.local/bin'];
   const exportLine = shellPathExportLine(shell, localBinDirectory);
 
   let existingContent = '';
@@ -312,7 +333,7 @@ export function ensureLocalBinOnShellPath(options: {
   }
 
   let outcome: ShellPathSetupOutcome;
-  if (existingContent.includes(localBinDirectory) || existingContent.includes(binPathLiteral)) {
+  if (binPathLiterals.some((literal) => existingContent.includes(literal))) {
     logger.info(`${purposeLabel} PATH already configured in ${configFile}`);
     outcome = 'rc-file-already-configured';
   } else {

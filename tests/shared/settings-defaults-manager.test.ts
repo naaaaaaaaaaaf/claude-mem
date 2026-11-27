@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync, chmodSync, symlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir, tmpdir } from 'os';
-import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
+import { SettingsDefaultsManager, type SettingsDefaults } from '../../src/shared/SettingsDefaultsManager.js';
 import { getDefaultServerPort, getDefaultWorkerPort } from '../../src/shared/install-port.js';
 import { readFlatSettings } from '../../src/npx-cli/utils/settings.js';
 import { DEFAULT_SETTINGS as VIEWER_DEFAULT_SETTINGS } from '../../src/ui/viewer/constants/settings.js';
@@ -85,6 +85,15 @@ describe('SettingsDefaultsManager', () => {
 
     writeFileSync(settingsPath, JSON.stringify({ CLAUDE_MEM_LINE_ANCHORS_ENABLED: 'true' }));
     expect(SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_LINE_ANCHORS_ENABLED).toBe('true');
+  });
+
+  it('host-mode-default-off', () => {
+    // Typed index: the root typecheck fails if the interface drops the key.
+    const defaultValue: SettingsDefaults['CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_HOST'] = 'false';
+
+    expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_HOST).toBe(defaultValue);
+    // A fresh settings file is seeded from DEFAULTS, so host mode stays off there too.
+    expect(SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_HOST).toBe(defaultValue);
   });
 
   describe('loadFromFile', () => {
@@ -1409,6 +1418,10 @@ describe('Chroma resource-pacing defaults', () => {
   it('leaves the chroma-mcp thread cap off by default (#6365, 39f110260)', () => {
     expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_CHROMA_MAX_THREADS).toBe('0');
   });
+
+  it('seeds the --exclude-newer sentinel, not a date, so the release cutoff keeps moving (#3610)', () => {
+    expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_CHROMA_EXCLUDE_NEWER).toBe('default');
+  });
 });
 
 describe('Chroma embedding function default', () => {
@@ -1420,6 +1433,12 @@ describe('Chroma embedding function default', () => {
 describe('embedding model default', () => {
   it('keeps all-MiniLM-L6-v2, the model Chroma embeds with', () => {
     expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_EMBEDDING_MODEL).toBe('all-MiniLM-L6-v2');
+  });
+});
+
+describe('per-session observer model opt-in default', () => {
+  it('is off by default so the global model and preset keep their previous behavior', () => {
+    expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_SESSION).toBe('false');
   });
 });
 
