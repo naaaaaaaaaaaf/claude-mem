@@ -1137,8 +1137,6 @@ var init_SettingsDefaultsManager = __esm({
         // Model id passed verbatim. Empty = the preset's default model.
         CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_SESSION: "false",
         // opt-in: use the model selected in the host session
-        CLAUDE_MEM_OPENAI_COMPAT_MODEL_FROM_HOST: "false",
-        // opt-in: read host configured model
         CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT: "",
         CLAUDE_MEM_OPENAI_COMPAT_REASONING: "",
         // off | on. Empty = off: every openai-compatible request sends reasoning:{enabled:false}. "on" leaves reasoning to the endpoint.
@@ -1275,8 +1273,6 @@ var init_SettingsDefaultsManager = __esm({
         // chroma-mcp starts as `nice -n N uvx ...` where `nice` exists (not Windows). 0 = off, max 19
         CLAUDE_MEM_CHROMA_MAX_THREADS: "0",
         // Opt-in cap on chroma-mcp's embedding threads and Linux CPU affinity (`taskset`). 0 = off: 39f110260 removed an always-on cap that slowed backfill. 2 suits machines where chroma-mcp pins cores (#6365)
-        CLAUDE_MEM_CHROMA_EXCLUDE_NEWER: "default",
-        // uvx --exclude-newer cutoff that freezes chroma-mcp's resolve (#3610). Not a date: this file seeds every default, and a seeded date would never follow a release's bump. '' = off (mirrors without PEP 700 upload times); or a YYYY-MM-DD date / RFC 3339 timestamp
         // Embedding function used when creating the Chroma collection. 'default' is
         // the local all-MiniLM-L6-v2 (English-tuned). The pinned chroma-mcp also
         // accepts 'openai', 'cohere', 'jina', 'voyageai' and 'roboflow'; those are
@@ -6813,20 +6809,6 @@ function buildAgentView(state, records2, { now = Date.now(), workLimit = 240, ac
     if (stop) evidence2.push({ evidence: stop.source, atEpoch: stop.stoppedAtEpoch, sourceRef: { kind: "work-state", id: stop.entryId } });
     if (group.launch?.returnedAtEpoch) evidence2.push({ evidence: "agent-call-returned", atEpoch: group.launch.returnedAtEpoch, sourceRef: group.launch.shared ? null : { kind: "tool-use", id: group.launch.toolUseId } });
     return evidence2.filter((entry) => entry.atEpoch >= lastActive).sort((a, b) => b.atEpoch - a.atEpoch)[0] ?? null;
-  }
-  const promptsBySessionId = /* @__PURE__ */ new Map();
-  for (const prompt of prompts) {
-    if (!promptsBySessionId.has(prompt.session_db_id)) promptsBySessionId.set(prompt.session_db_id, []);
-    promptsBySessionId.get(prompt.session_db_id).push(prompt);
-  }
-  const groupedSessionIds = new Set([...groups.values()].filter((group) => !group.isSubagent).map((group) => group.sessionId));
-  for (const session of sessions) {
-    if (session.id == null || groupedSessionIds.has(session.id)) continue;
-    if (ledger?.groups?.ignored?.[conversationKey(session)]) continue;
-    const own2 = promptsBySessionId.get(session.id) ?? [];
-    if (!originalFor(session, own2)) continue;
-    const group = getGroup({ session, agentId: null, agentType: null, project: session.project });
-    group.lastActivityEpoch = Math.max(group.lastActivityEpoch, session.started_at_epoch ?? 0, ...own2.map((prompt) => prompt.created_at_epoch ?? 0));
   }
   const agents = [...groups.values()].map((group) => {
     const { lastActivityEpoch, ...publicGroup } = group;
